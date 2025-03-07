@@ -1,0 +1,24 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        //go run ./main.go -image 172.27.208.223:10043/xjy/worktest/busybox:1.33  -insecure
+        {
+            "name": "Launch Package",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/main.go",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-image",
+                "172.27.208.223:10043/xjy/worktest/busybox:1.33",
+                "-insecure"
+            ],
+            "env": {},
+            "showLog": true
+        }
+    ]
+}
