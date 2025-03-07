@@ -16,22 +16,22 @@
 
 ```bash
 # 拉取镜像
-docker-pull --image nginx:latest
+dip --image nginx:latest
 
 # 指定输出文件
-docker-pull --image nginx:latest --output nginx.tar
+dip --image nginx:latest --output nginx.tar
 
 # 从自定义 Registry 拉取
-docker-pull --image registry.example.com/myapp:v1.0 --output myapp.tar
+dip --image registry.example.com/myapp:v1.0 --output myapp.tar
 
 # 拉取私有仓库镜像（需要认证）
-docker-pull --image private-registry.com/myapp:v1.0 --username user --password pass
+dip --image private-registry.com/myapp:v1.0 --username user --password pass
 
 # 拉取指定架构的镜像
-docker-pull --image nginx:latest --arch arm64
+dip --image nginx:latest --arch arm64
 
 # 允许不安全的HTTPS连接
-docker-pull --image insecure-registry.com/myapp:v1.0 --insecure
+dip --image insecure-registry.com/myapp:v1.0 --insecure
 ```
 
 ### 命令行参数
@@ -61,7 +61,7 @@ docker-pull --image insecure-registry.com/myapp:v1.0 --insecure
 ### 拉取 Nginx 镜像
 
 ```bash
-docker-pull --image nginx:latest
+dip --image nginx:latest
 ```
 
 输出：
@@ -92,12 +92,12 @@ docker load -i nginx-latest-amd64.tar
 
 ```bash
 # 使用用户名密码认证
-docker-pull --image private-registry.com/myapp:v1.0 \
+dip --image private-registry.com/myapp:v1.0 \
            --username myuser \
            --password mypass
 
 # 允许自签名证书
-docker-pull --image private-registry.com/myapp:v1.0 \
+dip --image private-registry.com/myapp:v1.0 \
            --username myuser \
            --password mypass \
            --insecure
@@ -107,8 +107,8 @@ docker-pull --image private-registry.com/myapp:v1.0 \
 
 ```bash
 # 拉取 ARM64 架构的镜像
-docker-pull --image nginx:latest --arch arm64
+dip --image nginx:latest --arch arm64
 
 # 拉取 AMD64 架构的镜像
-docker-pull --image nginx:latest --arch amd64
+dip --image nginx:latest --arch amd64
 ```
