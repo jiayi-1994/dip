@@ -50,7 +50,7 @@ jobs:
         path: artifacts
 
     - name: Create Release
-      uses: softprops/action-gh-release@v4
+      uses: softprops/action-gh-release@v1
       with:
         files: |
           artifacts/dip-windows-amd64/dip.exe
