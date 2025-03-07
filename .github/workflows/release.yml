@@ -7,8 +7,9 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         goos: [windows, linux]
         goarch: [amd64, arm64]
@@ -19,7 +20,7 @@ jobs:
             ext: ''
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Set up Go
       uses: actions/setup-go@v4
@@ -41,7 +42,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/download-artifact@v3
       with:
