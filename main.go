@@ -99,17 +99,31 @@ func parseFlags() Config {
 	config := Config{}
 
 	flag.StringVar(&config.Image, "image", "", "Docker镜像名称 (格式: [registry/]repository[:tag])")
+	flag.StringVar(&config.Image, "i", "", "Docker镜像名称 (格式: [registry/]repository[:tag])")
 	flag.StringVar(&config.Output, "output", "", "输出文件路径 (默认: repository-tag.tar)")
+	flag.StringVar(&config.Output, "o", "", "输出文件路径 (默认: repository-tag.tar)")
 	flag.StringVar(&config.Registry, "registry", "registry-1.docker.io", "Docker Registry地址")
+	flag.StringVar(&config.Registry, "r", "registry-1.docker.io", "Docker Registry地址")
 	flag.StringVar(&config.Username, "username", "", "Registry用户名")
+	flag.StringVar(&config.Username, "u", "", "Registry用户名")
 	flag.StringVar(&config.Password, "password", "", "Registry密码")
+	flag.StringVar(&config.Password, "p", "", "Registry密码")
 	flag.StringVar(&config.Arch, "arch", "amd64", "镜像架构 (例如: amd64, arm64)")
+	flag.StringVar(&config.Arch, "a", "amd64", "镜像架构 (例如: amd64, arm64)")
 	flag.BoolVar(&config.Insecure, "insecure", false, "允许不安全的HTTPS连接")
+	flag.BoolVar(&config.Insecure, "k", false, "允许不安全的HTTPS连接")
 	flag.BoolVar(&config.ShowVersion, "version", false, "显示版本信息")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法: docker-pull [选项]\n\n选项:\n")
-		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "  -i, --image string\t\tDocker镜像名称 (格式: [registry/]repository[:tag])\n")
+		fmt.Fprintf(os.Stderr, "  -o, --output string\t\t输出文件路径 (默认: repository-tag.tar)\n")
+		fmt.Fprintf(os.Stderr, "  -r, --registry string\t\tDocker Registry地址 (默认: registry-1.docker.io)\n")
+		fmt.Fprintf(os.Stderr, "  -u, --username string\t\tRegistry用户名\n")
+		fmt.Fprintf(os.Stderr, "  -p, --password string\t\tRegistry密码\n")
+		fmt.Fprintf(os.Stderr, "  -a, --arch string\t\t镜像架构 (例如: amd64, arm64) (默认: amd64)\n")
+		fmt.Fprintf(os.Stderr, "  -k, --insecure\t\t允许不安全的HTTPS连接\n")
+		fmt.Fprintf(os.Stderr, "      --version\t\t\t显示版本信息\n")
 	}
 
 	flag.Parse()
