@@ -36,16 +36,16 @@ dip --image insecure-registry.com/myapp:v1.0 --insecure
 
 ### 命令行参数
 
-| 参数 | 描述 | 默认值 |
-|------|------|--------|
-| `--image` | Docker镜像名称 (格式: [registry/]repository[:tag]) | 无，必须指定 |
-| `--output` | 输出文件路径 | repository-tag-arch.tar |
-| `--registry` | Docker Registry地址 | registry-1.docker.io |
-| `--username` | Registry用户名 | 空 |
-| `--password` | Registry密码 | 空 |
-| `--arch` | 镜像架构 (例如: amd64, arm64) | amd64 |
-| `--insecure` | 允许不安全的HTTPS连接 | false |
-| `--version` | 显示版本信息 | false |
+| 参数 | 简写 | 描述 | 默认值 |
+|------|------|------|--------|
+| `--image` | `-i` | Docker镜像名称 (格式: [registry/]repository[:tag]) | 无，必须指定 |
+| `--output` | `-o` | 输出文件路径 | repository-tag-arch.tar |
+| `--registry` | `-r` | Docker Registry地址 | registry-1.docker.io |
+| `--username` | `-u` | Registry用户名 | 空 |
+| `--password` | `-p` | Registry密码 | 空 |
+| `--arch` | `-a` | 镜像架构 (例如: amd64, arm64) | amd64 |
+| `--insecure` | `-k` | 允许不安全的HTTPS连接 | false |
+| `--version` | - | 显示版本信息 | false |
 
 ### 镜像名称格式
 
