@@ -53,13 +53,12 @@ jobs:
     steps:
     - uses: actions/download-artifact@v4
       with:
-        name: dip-${{ matrix.goos }}-${{ matrix.goarch }}
         path: artifacts
 
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
         files: |
-          artifacts/*/dip*
+          artifacts/dip*
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
