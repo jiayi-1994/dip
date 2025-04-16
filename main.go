@@ -421,7 +421,13 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 	// 如果提供了缓存目录，首先检查缓存
 	if cacheDir != "" {
 		if cachedFile, exists := checkLayerCache(cacheDir, digest); exists {
-			return cachedFile, nil
+			// 将缓存文件复制到临时目录
+			tempFile := filepath.Join(tempDir, strings.Replace(digest, ":", "_", 1))
+			if err := copyFile(cachedFile, tempFile); err != nil {
+				fmt.Printf("警告: 无法从缓存复制文件: %v，将重新下载\n", err)
+			} else {
+				return tempFile, nil
+			}
 		}
 	}
 
@@ -578,23 +584,21 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 	// 完成下载，清除进度显示并换行
 	fmt.Println()
 
-	// 如果提供了缓存目录，将文件移动到缓存
-	if cacheDir != "" {
-		cacheFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
-		if err := moveToCache(tempFile, cacheFile); err != nil {
-			fmt.Printf("警告: 无法将文件移动到缓存: %v\n", err)
-			// 如果移动到缓存失败，仍然使用临时文件
-			return layerFile, nil
+	// 重命名临时文件
+	if err := os.Rename(tempFile, layerFile); err != nil {
+		// 如果重命名失败，尝试复制
+		if err := copyFile(tempFile, layerFile); err != nil {
+			return "", fmt.Errorf("移动文件失败: %v", err)
 		}
-		// 清理状态文件
-		stateFile := getStateFilePath(tempDir, digest)
-		os.Remove(stateFile)
-		return cacheFile, nil
+		os.Remove(tempFile)
 	}
 
-	// 如果没有缓存目录，使用临时文件
-	if err := os.Rename(tempFile, layerFile); err != nil {
-		return "", fmt.Errorf("重命名文件失败: %v", err)
+	// 如果提供了缓存目录，将文件复制到缓存
+	if cacheDir != "" {
+		cacheFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
+		if err := copyFile(layerFile, cacheFile); err != nil {
+			fmt.Printf("警告: 无法将文件复制到缓存: %v\n", err)
+		}
 	}
 
 	// 清理状态文件
@@ -961,6 +965,39 @@ func checkLayerCache(cacheDir, digest string) (string, bool) {
 	return cachedFile, false
 }
 
+// 复制文件
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	if err != nil {
+		return err
+	}
+
+	// 确保写入磁盘
+	err = destFile.Sync()
+	if err != nil {
+		return err
+	}
+
+	// 复制文件权限
+	sourceInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(dst, sourceInfo.Mode())
+}
+
 // 将层文件移动到缓存
 func moveToCache(tempFile, cacheFile string) error {
 	// 确保缓存目录存在
@@ -975,6 +1012,11 @@ func moveToCache(tempFile, cacheFile string) error {
 		}
 	}
 
-	// 移动文件到缓存
-	return os.Rename(tempFile, cacheFile)
+	// 先复制文件
+	if err := copyFile(tempFile, cacheFile); err != nil {
+		return err
+	}
+
+	// 复制成功后删除源文件
+	return os.Remove(tempFile)
 }
