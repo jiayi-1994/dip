@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -28,6 +29,16 @@ type Config struct {
 	Insecure    bool
 	ShowVersion bool
 	Arch        string
+	CacheDir    string // 添加缓存目录配置
+}
+
+// DownloadState 保存下载状态
+type DownloadState struct {
+	LayerDigest  string    `json:"layer_digest"`
+	Downloaded   int64     `json:"downloaded"`
+	TotalSize    int64     `json:"total_size"`
+	LastModified time.Time `json:"last_modified"`
+	PartialHash  string    `json:"partial_hash"`
 }
 
 // 主函数
@@ -110,6 +121,7 @@ func parseFlags() Config {
 	flag.StringVar(&config.Password, "p", "", "Registry密码")
 	flag.StringVar(&config.Arch, "arch", "amd64", "镜像架构 (例如: amd64, arm64)")
 	flag.StringVar(&config.Arch, "a", "amd64", "镜像架构 (例如: amd64, arm64)")
+	flag.StringVar(&config.CacheDir, "cache-dir", "", "层缓存目录 (默认: ~/.docker-pull/cache)")
 	flag.BoolVar(&config.Insecure, "insecure", false, "允许不安全的HTTPS连接")
 	flag.BoolVar(&config.Insecure, "k", false, "允许不安全的HTTPS连接")
 	flag.BoolVar(&config.ShowVersion, "version", false, "显示版本信息")
@@ -122,6 +134,7 @@ func parseFlags() Config {
 		fmt.Fprintf(os.Stderr, "  -u, --username string\t\tRegistry用户名\n")
 		fmt.Fprintf(os.Stderr, "  -p, --password string\t\tRegistry密码\n")
 		fmt.Fprintf(os.Stderr, "  -a, --arch string\t\t镜像架构 (例如: amd64, arm64) (默认: amd64)\n")
+		fmt.Fprintf(os.Stderr, "      --cache-dir string\t\t层缓存目录 (默认: ~/.docker-pull/cache)\n")
 		fmt.Fprintf(os.Stderr, "  -k, --insecure\t\t允许不安全的HTTPS连接\n")
 		fmt.Fprintf(os.Stderr, "      --version\t\t\t显示版本信息\n")
 	}
@@ -331,6 +344,14 @@ func getManifest(client *http.Client, registry, repository, tag, auth string, ar
 func downloadLayers(client *http.Client, registry, repository string, manifest map[string]interface{}, auth, tempDir string) ([]string, error) {
 	var layers []interface{}
 
+	// 获取缓存目录
+	config := Config{} // 使用默认配置
+	cacheDir, err := getCacheDir(config)
+	if err != nil {
+		fmt.Printf("警告: 无法获取缓存目录: %v，将不使用缓存\n", err)
+		cacheDir = ""
+	}
+
 	// 检查manifest版本并获取层信息
 	if schemaVersion, ok := manifest["schemaVersion"].(float64); ok {
 		if schemaVersion == 1 {
@@ -370,10 +391,19 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 			return nil, fmt.Errorf("无效的层摘要")
 		}
 
+		// 检查缓存
+		if cacheDir != "" {
+			if cachedFile, exists := checkLayerCache(cacheDir, digest); exists {
+				fmt.Printf("层 %d/%d: %s 从缓存中获取\n", i+1, len(layers), digest)
+				layerFiles = append(layerFiles, cachedFile)
+				continue
+			}
+		}
+
 		fmt.Printf("下载层 %d/%d: %s\n", i+1, len(layers), digest)
 
 		// 下载层
-		layerFile, err := downloadLayer(client, registry, repository, digest, auth, tempDir)
+		layerFile, err := downloadLayer(client, registry, repository, digest, auth, tempDir, cacheDir)
 		if err != nil {
 			return nil, err
 		}
@@ -385,9 +415,37 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 }
 
 // 下载单个镜像层
-func downloadLayer(client *http.Client, registry, repository, digest, auth, tempDir string) (string, error) {
+func downloadLayer(client *http.Client, registry, repository, digest, auth, tempDir, cacheDir string) (string, error) {
 	url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, digest)
 
+	// 如果提供了缓存目录，首先检查缓存
+	if cacheDir != "" {
+		if cachedFile, exists := checkLayerCache(cacheDir, digest); exists {
+			return cachedFile, nil
+		}
+	}
+
+	layerFile := filepath.Join(tempDir, strings.Replace(digest, ":", "_", 1))
+	tempFile := layerFile + ".downloading"
+
+	// 尝试加载之前的下载状态
+	state, err := loadDownloadState(tempDir, digest)
+	if err != nil {
+		return "", fmt.Errorf("加载下载状态失败: %v", err)
+	}
+
+	var startOffset int64
+	var partialHash = sha256.New()
+
+	// 检查是否存在未完成的下载
+	if state != nil && verifyPartialDownload(tempFile, state) {
+		startOffset = state.Downloaded
+		fmt.Printf("发现未完成的下载，从 %.2f MB 处继续\n", float64(startOffset)/(1024*1024))
+	} else {
+		startOffset = 0
+	}
+
+	// 创建请求
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
@@ -398,79 +456,150 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 		req.Header.Set("Authorization", auth)
 	}
 
+	// 如果有起始偏移，添加Range头
+	if startOffset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
+	}
+
+	// 发送请求
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// 检查响应状态
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return "", fmt.Errorf("下载层失败，状态码: %d", resp.StatusCode)
 	}
 
-	// 获取文件大小
-	totalSize := resp.ContentLength
+	// 获取文件总大小
+	var totalSize int64
+	if resp.StatusCode == http.StatusPartialContent {
+		totalSize = resp.ContentLength + startOffset
+	} else {
+		totalSize = resp.ContentLength
+	}
 
-	// 创建临时文件
-	layerFile := filepath.Join(tempDir, strings.Replace(digest, ":", "_", 1))
-	file, err := os.Create(layerFile)
+	// 创建或打开文件
+	file, err := func() (*os.File, error) {
+		if startOffset > 0 {
+			return os.OpenFile(tempFile, os.O_APPEND|os.O_WRONLY, 0644)
+		}
+		return os.Create(tempFile)
+	}()
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
 
-	// 创建进度条读取器
-	downloaded := int64(0)
+	// 创建进度跟踪变量
+	downloaded := startOffset
 	startTime := time.Now()
 	lastUpdateTime := startTime
-	lastDownloaded := int64(0)
+	lastDownloaded := downloaded
+	var currentHash string
 
-	reader := io.TeeReader(resp.Body, file)
+	// 创建缓冲读取器
 	buf := make([]byte, 32*1024) // 32KB 缓冲区
 
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			downloaded += int64(n)
+	// 使用匿名函数确保资源正确释放
+	err = func() error {
+		defer file.Close()
 
-			// 每100ms更新一次进度显示
-			now := time.Now()
-			if now.Sub(lastUpdateTime) >= 100*time.Millisecond {
-				// 计算下载速度
-				elapsed := now.Sub(lastUpdateTime).Seconds()
-				speed := float64(downloaded-lastDownloaded) / elapsed
-
-				// 计算剩余时间
-				var remainingTime time.Duration
-				if speed > 0 {
-					remaining := float64(totalSize-downloaded) / speed
-					remainingTime = time.Duration(remaining * float64(time.Second))
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				// 写入文件
+				if _, err := file.Write(buf[:n]); err != nil {
+					return err
 				}
 
-				// 显示进度
-				progress := float64(downloaded) / float64(totalSize) * 100
-				fmt.Printf("\r下载进度: %.1f%% | %.2f MB/%.2f MB | %.2f MB/s | 剩余时间: %v",
-					progress,
-					float64(downloaded)/(1024*1024),
-					float64(totalSize)/(1024*1024),
-					speed/(1024*1024),
-					remainingTime.Round(time.Second))
+				// 更新哈希
+				partialHash.Write(buf[:n])
+				downloaded += int64(n)
 
-				lastUpdateTime = now
-				lastDownloaded = downloaded
+				// 每100ms更新一次进度显示
+				now := time.Now()
+				if now.Sub(lastUpdateTime) >= 100*time.Millisecond {
+					// 计算下载速度
+					elapsed := now.Sub(lastUpdateTime).Seconds()
+					speed := float64(downloaded-lastDownloaded) / elapsed
+
+					// 计算剩余时间
+					var remainingTime time.Duration
+					if speed > 0 {
+						remaining := float64(totalSize-downloaded) / speed
+						remainingTime = time.Duration(remaining * float64(time.Second))
+					}
+
+					// 显示进度
+					progress := float64(downloaded) / float64(totalSize) * 100
+					fmt.Printf("\r下载进度: %.1f%% | %.2f MB/%.2f MB | %.2f MB/s | 剩余时间: %v",
+						progress,
+						float64(downloaded)/(1024*1024),
+						float64(totalSize)/(1024*1024),
+						speed/(1024*1024),
+						remainingTime.Round(time.Second))
+
+					// 更新下载状态
+					currentHash = fmt.Sprintf("%x", partialHash.Sum(nil))
+					state = &DownloadState{
+						LayerDigest:  digest,
+						Downloaded:   downloaded,
+						TotalSize:    totalSize,
+						LastModified: now,
+						PartialHash:  currentHash,
+					}
+					if err := saveDownloadState(*state, tempDir); err != nil {
+						fmt.Printf("\n警告: 保存下载状态失败: %v\n", err)
+					}
+
+					lastUpdateTime = now
+					lastDownloaded = downloaded
+				}
+			}
+
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
 			}
 		}
 
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", err
-		}
+		// 确保所有数据都写入磁盘
+		return file.Sync()
+	}()
+
+	if err != nil {
+		return "", err
 	}
 
 	// 完成下载，清除进度显示并换行
 	fmt.Println()
+
+	// 如果提供了缓存目录，将文件移动到缓存
+	if cacheDir != "" {
+		cacheFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
+		if err := moveToCache(tempFile, cacheFile); err != nil {
+			fmt.Printf("警告: 无法将文件移动到缓存: %v\n", err)
+			// 如果移动到缓存失败，仍然使用临时文件
+			return layerFile, nil
+		}
+		// 清理状态文件
+		stateFile := getStateFilePath(tempDir, digest)
+		os.Remove(stateFile)
+		return cacheFile, nil
+	}
+
+	// 如果没有缓存目录，使用临时文件
+	if err := os.Rename(tempFile, layerFile); err != nil {
+		return "", fmt.Errorf("重命名文件失败: %v", err)
+	}
+
+	// 清理状态文件
+	stateFile := getStateFilePath(tempDir, digest)
+	os.Remove(stateFile)
 
 	return layerFile, nil
 }
@@ -746,4 +875,106 @@ func addImageConfig(tw *tar.Writer, imageID string, config map[string]interface{
 
 	_, err = tw.Write(content)
 	return err
+}
+
+// 获取下载状态文件路径
+func getStateFilePath(tempDir, digest string) string {
+	return filepath.Join(tempDir, strings.Replace(digest, ":", "_", 1)+".state")
+}
+
+// 保存下载状态
+func saveDownloadState(state DownloadState, tempDir string) error {
+	stateFile := getStateFilePath(tempDir, state.LayerDigest)
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(stateFile, data, 0644)
+}
+
+// 读取下载状态
+func loadDownloadState(tempDir, digest string) (*DownloadState, error) {
+	stateFile := getStateFilePath(tempDir, digest)
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var state DownloadState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+// 验证部分下载的文件
+func verifyPartialDownload(filePath string, state *DownloadState) bool {
+	if state == nil {
+		return false
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	n, err := io.Copy(hash, file)
+	if err != nil || n != state.Downloaded {
+		return false
+	}
+
+	return fmt.Sprintf("%x", hash.Sum(nil)) == state.PartialHash
+}
+
+// 获取缓存目录
+func getCacheDir(config Config) (string, error) {
+	if config.CacheDir != "" {
+		return config.CacheDir, nil
+	}
+
+	// 默认缓存目录
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	cacheDir := filepath.Join(homeDir, ".docker-pull", "cache")
+
+	// 创建缓存目录（如果不存在）
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return "", err
+	}
+
+	return cacheDir, nil
+}
+
+// 检查缓存中是否存在层文件
+func checkLayerCache(cacheDir, digest string) (string, bool) {
+	cachedFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
+	if _, err := os.Stat(cachedFile); err == nil {
+		return cachedFile, true
+	}
+	return cachedFile, false
+}
+
+// 将层文件移动到缓存
+func moveToCache(tempFile, cacheFile string) error {
+	// 确保缓存目录存在
+	if err := os.MkdirAll(filepath.Dir(cacheFile), 0755); err != nil {
+		return err
+	}
+
+	// 如果目标文件已存在，先删除
+	if _, err := os.Stat(cacheFile); err == nil {
+		if err := os.Remove(cacheFile); err != nil {
+			return err
+		}
+	}
+
+	// 移动文件到缓存
+	return os.Rename(tempFile, cacheFile)
 }
