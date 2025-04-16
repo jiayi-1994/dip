@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -96,10 +97,10 @@ func main() {
 	}
 
 	// 创建tar文件
-	err = createTarFile(outputFile, layers, manifest, repository, tag)
+	err = createTarFile(outputFile, manifest, layers, repository, tag)
 	if err != nil {
 		fmt.Printf("创建tar文件失败: %v\n", err)
-		os.Exit(1)
+		return
 	}
 
 	fmt.Printf("镜像已成功保存到: %s\n", outputFile)
@@ -609,54 +610,85 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 }
 
 // 创建tar文件
-func createTarFile(outputFile string, layers []string, manifest map[string]interface{}, repository, tag string) error {
-	fmt.Printf("创建tar文件: %s\n", outputFile)
+func createTarFile(outputPath string, manifest map[string]interface{}, layerFiles []string, repository, tag string) error {
+	// 创建临时目录用于存储压缩后的层文件
+	tempDir, err := os.MkdirTemp("", "docker-layers-*")
+	if err != nil {
+		return fmt.Errorf("创建临时目录失败: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
 
 	// 创建输出文件
-	file, err := os.Create(outputFile)
+	outputFile, err := os.Create(outputPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("创建输出文件失败: %v", err)
 	}
-	defer file.Close()
+	defer outputFile.Close()
 
 	// 创建tar写入器
-	tw := tar.NewWriter(file)
+	tw := tar.NewWriter(outputFile)
 	defer tw.Close()
 
-	// 获取配置信息
+	// 处理每个层文件
+	layerIDs := make([]string, len(layerFiles))
+	diffIDs := make([]string, len(layerFiles))
+	for i, layerFile := range layerFiles {
+		// 生成层ID
+		layerID := fmt.Sprintf("layer_%x", sha256.Sum256([]byte(fmt.Sprintf("%s_%d", layerFile, i))))[:32]
+		layerIDs[i] = layerID
+
+		// 检查源文件是否存在且有效
+		if _, err := os.Stat(layerFile); err != nil {
+			return fmt.Errorf("层文件无效: %v", err)
+		}
+
+		// 添加层文件
+		layerTarPath := filepath.Join(layerID, "layer.tar")
+		if err := addFileToTar(tw, layerFile, layerTarPath); err != nil {
+			return fmt.Errorf("添加层文件失败: %v", err)
+		}
+
+		// 计算diffID
+		diffID, err := calculateDiffID(layerFile)
+		if err != nil {
+			return fmt.Errorf("计算diffID失败: %v", err)
+		}
+		diffIDs[i] = diffID
+
+		// 添加VERSION文件
+		if err := addVersionFile(tw, layerID); err != nil {
+			return fmt.Errorf("添加VERSION文件失败: %v", err)
+		}
+
+		// 添加json文件
+		if err := addLayerJSON(tw, layerID); err != nil {
+			return fmt.Errorf("添加json文件失败: %v", err)
+		}
+	}
+
+	// 获取镜像配置
 	config, err := getImageConfig(manifest)
 	if err != nil {
 		return fmt.Errorf("获取镜像配置失败: %v", err)
 	}
 
+	// 添加rootfs信息
+	config["rootfs"] = map[string]interface{}{
+		"type":     "layers",
+		"diff_ids": diffIDs,
+	}
+
 	// 生成镜像ID
 	imageID := generateImageID(config)
 
-	// 添加层文件到tar
-	layerIDs := make([]string, 0, len(layers))
-	for _, layerFile := range layers {
-		layerID := filepath.Base(layerFile)
-		layerIDs = append(layerIDs, layerID)
-
-		// 添加层文件到tar
-		if err := addFileToTar(tw, layerFile, layerID+"/layer.tar"); err != nil {
-			return fmt.Errorf("添加层文件失败: %v", err)
-		}
-
-		// 添加层版本文件
-		if err := addVersionFile(tw, layerID); err != nil {
-			return fmt.Errorf("添加层版本文件失败: %v", err)
-		}
-
-		// 添加层json文件
-		if err := addLayerJSON(tw, layerID); err != nil {
-			return fmt.Errorf("添加层JSON文件失败: %v", err)
-		}
+	// 添加镜像配置文件
+	if err := addImageConfig(tw, imageID, config, layerIDs); err != nil {
+		return fmt.Errorf("添加镜像配置失败: %v", err)
 	}
 
-	// 添加manifest.json文件
+	// 添加manifest.json
 	if err := addManifestJSON(tw, repository, tag, imageID, layerIDs); err != nil {
-		return fmt.Errorf("添加manifest.json文件失败: %v", err)
+		return fmt.Errorf("添加manifest.json失败: %v", err)
 	}
 
 	// 添加repositories文件
@@ -664,9 +696,9 @@ func createTarFile(outputFile string, layers []string, manifest map[string]inter
 		return fmt.Errorf("添加repositories文件失败: %v", err)
 	}
 
-	// 添加镜像配置文件
-	if err := addImageConfig(tw, imageID, config, layerIDs); err != nil {
-		return fmt.Errorf("添加镜像配置文件失败: %v", err)
+	// 确保所有数据都写入
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("关闭tar文件失败: %v", err)
 	}
 
 	return nil
@@ -674,64 +706,101 @@ func createTarFile(outputFile string, layers []string, manifest map[string]inter
 
 // 获取镜像配置
 func getImageConfig(manifest map[string]interface{}) (map[string]interface{}, error) {
-	// 简化实现，实际项目中需要从manifest中提取config
-	config := make(map[string]interface{})
-	config["architecture"] = "amd64"
-	config["os"] = "linux"
-	config["config"] = map[string]interface{}{
-		"Hostname":     "",
-		"Domainname":   "",
-		"User":         "",
-		"ExposedPorts": map[string]interface{}{},
-		"Env":          []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
-		"Cmd":          []string{"/bin/sh"},
-		"WorkingDir":   "/",
+	config := map[string]interface{}{
+		"architecture": "amd64",
+		"os":           "linux",
+		"config":       manifest["config"],
+		"created":      time.Now().UTC().Format(time.RFC3339Nano),
+		"history":      []interface{}{},
 	}
 	return config, nil
 }
 
 // 生成镜像ID
 func generateImageID(config map[string]interface{}) string {
-	// 简化实现，实际项目中应该计算配置的SHA256
-	return "sha256:" + base64Encode(fmt.Sprintf("%v", config))[:12]
+	content, err := json.Marshal(config)
+	if err != nil {
+		return ""
+	}
+
+	hash := sha256.Sum256(content)
+	return fmt.Sprintf("%x", hash)
 }
 
 // 添加文件到tar
 func addFileToTar(tw *tar.Writer, filePath, tarPath string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("打开文件失败: %v", err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("获取文件信息失败: %v", err)
 	}
 
+	// 统一使用 / 作为路径分隔符
+	tarPath = filepath.ToSlash(tarPath)
+
+	// 确保路径不以 / 开头
+	tarPath = strings.TrimPrefix(tarPath, "/")
+
 	header := &tar.Header{
-		Name:    tarPath,
-		Size:    info.Size(),
-		Mode:    int64(info.Mode()),
-		ModTime: info.ModTime(),
+		Name:     tarPath,
+		Size:     info.Size(),
+		Mode:     0644,
+		ModTime:  time.Now(),
+		Typeflag: tar.TypeReg,
+		Uid:      0,
+		Gid:      0,
+		Uname:    "root",
+		Gname:    "root",
+		Format:   tar.FormatGNU, // 使用GNU格式
 	}
 
 	if err := tw.WriteHeader(header); err != nil {
-		return err
+		return fmt.Errorf("写入tar头部失败: %v", err)
 	}
 
-	_, err = io.Copy(tw, file)
-	return err
+	// 使用缓冲读取
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	written := int64(0)
+	for {
+		n, err := file.Read(buf)
+		if n > 0 {
+			nw, err := tw.Write(buf[:n])
+			if err != nil {
+				return fmt.Errorf("写入tar内容失败: %v", err)
+			}
+			if nw != n {
+				return fmt.Errorf("写入不完整: 期望 %d 字节, 实际写入 %d 字节", n, nw)
+			}
+			written += int64(nw)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("读取文件失败: %v", err)
+		}
+	}
+
+	// 验证写入的大小
+	if written != info.Size() {
+		return fmt.Errorf("文件大小不匹配: 期望 %d 字节, 实际写入 %d 字节", info.Size(), written)
+	}
+
+	return nil
 }
 
-// 添加版本文件
+// 添加层版本文件
 func addVersionFile(tw *tar.Writer, layerID string) error {
 	content := []byte("1.0")
 	header := &tar.Header{
-		Name:    layerID + "/VERSION",
-		Size:    int64(len(content)),
-		Mode:    0644,
-		ModTime: time.Now(),
+		Name: layerID + "/VERSION",
+		Size: int64(len(content)),
+		Mode: 0644,
 	}
 
 	if err := tw.WriteHeader(header); err != nil {
@@ -742,66 +811,72 @@ func addVersionFile(tw *tar.Writer, layerID string) error {
 	return err
 }
 
-// 添加层JSON文件
+// 添加层json文件
 func addLayerJSON(tw *tar.Writer, layerID string) error {
-	layerJSON := map[string]interface{}{
-		"id":      layerID,
-		"created": time.Now().Format(time.RFC3339),
-		"container_config": map[string]interface{}{
-			"Hostname":   "",
+	content := []byte(`{
+		"id": "` + layerID + `",
+		"parent": "",
+		"created": "1970-01-01T00:00:00Z",
+		"container_config": {
+			"Hostname": "",
 			"Domainname": "",
-			"User":       "",
-			"Cmd":        []string{"/bin/sh"},
+			"User": "",
+			"AttachStdin": false,
+			"AttachStdout": false,
+			"AttachStderr": false,
+			"Tty": false,
+			"OpenStdin": false,
+			"StdinOnce": false,
+			"Env": null,
+			"Cmd": null,
+			"Image": "",
+			"Volumes": null,
+			"WorkingDir": "",
+			"Entrypoint": null,
+			"OnBuild": null,
+			"Labels": null
 		},
-	}
-
-	content, err := json.Marshal(layerJSON)
-	if err != nil {
-		return err
-	}
+		"os": "linux"
+	}`)
 
 	header := &tar.Header{
-		Name:    layerID + "/json",
-		Size:    int64(len(content)),
-		Mode:    0644,
-		ModTime: time.Now(),
+		Name: layerID + "/json",
+		Size: int64(len(content)),
+		Mode: 0644,
 	}
 
 	if err := tw.WriteHeader(header); err != nil {
 		return err
 	}
 
-	_, err = tw.Write(content)
+	_, err := tw.Write(content)
 	return err
 }
 
 // 添加manifest.json文件
 func addManifestJSON(tw *tar.Writer, repository, tag, imageID string, layerIDs []string) error {
-	// 构建层路径
-	layerPaths := make([]string, 0, len(layerIDs))
-	for _, layerID := range layerIDs {
-		layerPaths = append(layerPaths, layerID+"/layer.tar")
+	layers := make([]string, len(layerIDs))
+	for i, id := range layerIDs {
+		layers[i] = id + "/layer.tar"
 	}
 
-	// 构建manifest
 	manifest := []map[string]interface{}{
 		{
 			"Config":   imageID + ".json",
 			"RepoTags": []string{repository + ":" + tag},
-			"Layers":   layerPaths,
+			"Layers":   layers,
 		},
 	}
 
-	content, err := json.Marshal(manifest)
+	content, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
 	}
 
 	header := &tar.Header{
-		Name:    "manifest.json",
-		Size:    int64(len(content)),
-		Mode:    0644,
-		ModTime: time.Now(),
+		Name: "manifest.json",
+		Size: int64(len(content)),
+		Mode: 0644,
 	}
 
 	if err := tw.WriteHeader(header); err != nil {
@@ -814,23 +889,21 @@ func addManifestJSON(tw *tar.Writer, repository, tag, imageID string, layerIDs [
 
 // 添加repositories文件
 func addRepositoriesJSON(tw *tar.Writer, repository, tag, imageID string) error {
-	// 构建repositories
-	repos := map[string]interface{}{
-		repository: map[string]string{
+	repositories := map[string]map[string]string{
+		repository: {
 			tag: imageID,
 		},
 	}
 
-	content, err := json.Marshal(repos)
+	content, err := json.MarshalIndent(repositories, "", "  ")
 	if err != nil {
 		return err
 	}
 
 	header := &tar.Header{
-		Name:    "repositories",
-		Size:    int64(len(content)),
-		Mode:    0644,
-		ModTime: time.Now(),
+		Name: "repositories",
+		Size: int64(len(content)),
+		Mode: 0644,
 	}
 
 	if err := tw.WriteHeader(header); err != nil {
@@ -843,34 +916,15 @@ func addRepositoriesJSON(tw *tar.Writer, repository, tag, imageID string) error 
 
 // 添加镜像配置文件
 func addImageConfig(tw *tar.Writer, imageID string, config map[string]interface{}, layerIDs []string) error {
-	// 添加层历史
-	config["history"] = make([]map[string]interface{}, len(layerIDs))
-	// 将 history 转换为正确的类型并更新
-	history := make([]map[string]interface{}, len(layerIDs))
-	for i := range layerIDs {
-		history[i] = map[string]interface{}{
-			"created":    time.Now().Format(time.RFC3339),
-			"created_by": "/bin/sh",
-		}
-	}
-	config["history"] = history
-
-	// 添加rootfs信息
-	config["rootfs"] = map[string]interface{}{
-		"type":     "layers",
-		"diff_ids": layerIDs,
-	}
-
-	content, err := json.Marshal(config)
+	content, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
 
 	header := &tar.Header{
-		Name:    imageID + ".json",
-		Size:    int64(len(content)),
-		Mode:    0644,
-		ModTime: time.Now(),
+		Name: imageID + ".json",
+		Size: int64(len(content)),
+		Mode: 0644,
 	}
 
 	if err := tw.WriteHeader(header); err != nil {
@@ -1019,4 +1073,158 @@ func moveToCache(tempFile, cacheFile string) error {
 
 	// 复制成功后删除源文件
 	return os.Remove(tempFile)
+}
+
+// 压缩文件并计算 diff ID
+func compressFileAndCalculateDiffID(srcPath, dstPath string) (string, error) {
+	// 打开源文件
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("打开源文件失败: %v", err)
+	}
+	defer srcFile.Close()
+
+	// 检查文件大小
+	info, err := srcFile.Stat()
+	if err != nil {
+		return "", fmt.Errorf("获取文件信息失败: %v", err)
+	}
+	if info.Size() == 0 {
+		return "", fmt.Errorf("源文件大小为0")
+	}
+
+	// 创建目标文件
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return "", fmt.Errorf("创建目标文件失败: %v", err)
+	}
+	defer dstFile.Close()
+
+	// 创建 gzip writer
+	gw := gzip.NewWriter(dstFile)
+	defer gw.Close()
+
+	// 设置 gzip 头部信息
+	gw.Header = gzip.Header{
+		Name:    filepath.Base(srcPath),
+		ModTime: time.Now(),
+		OS:      255, // 255 表示未知操作系统
+	}
+
+	// 创建一个 tee reader 来同时计算 hash
+	hash := sha256.New()
+	teeReader := io.TeeReader(srcFile, hash)
+
+	// 使用缓冲写入
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	for {
+		n, err := teeReader.Read(buf)
+		if n > 0 {
+			if _, err := gw.Write(buf[:n]); err != nil {
+				return "", fmt.Errorf("写入压缩数据失败: %v", err)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("读取源文件失败: %v", err)
+		}
+	}
+
+	// 确保所有数据都写入
+	if err := gw.Close(); err != nil {
+		return "", fmt.Errorf("关闭gzip writer失败: %v", err)
+	}
+	if err := dstFile.Sync(); err != nil {
+		return "", fmt.Errorf("同步文件到磁盘失败: %v", err)
+	}
+
+	// 验证生成的文件
+	if fi, err := dstFile.Stat(); err != nil || fi.Size() == 0 {
+		return "", fmt.Errorf("生成的压缩文件无效")
+	}
+
+	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+}
+
+// 计算解压缩后内容的哈希值
+func calculateUncompressedHash(gzipFile string) (string, error) {
+	file, err := os.Open(gzipFile)
+	if err != nil {
+		return "", fmt.Errorf("打开文件失败: %v", err)
+	}
+	defer file.Close()
+
+	// 创建gzip reader
+	gr, err := gzip.NewReader(file)
+	if err != nil {
+		return "", fmt.Errorf("创建gzip reader失败: %v", err)
+	}
+	defer gr.Close()
+
+	// 计算解压缩后内容的哈希值
+	hash := sha256.New()
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	for {
+		n, err := gr.Read(buf)
+		if n > 0 {
+			if _, err := hash.Write(buf[:n]); err != nil {
+				return "", fmt.Errorf("计算哈希失败: %v", err)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("读取解压缩数据失败: %v", err)
+		}
+	}
+
+	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+}
+
+// 计算文件的 diff ID
+func calculateDiffID(filePath string) (string, error) {
+	// 检查文件是否为gzip格式
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("打开文件失败: %v", err)
+	}
+	defer file.Close()
+
+	// 读取前几个字节来检查gzip魔数
+	header := make([]byte, 2)
+	if _, err := file.Read(header); err != nil {
+		return "", fmt.Errorf("读取文件头失败: %v", err)
+	}
+
+	// 如果是gzip文件（魔数为1f 8b）
+	if header[0] == 0x1f && header[1] == 0x8b {
+		return calculateUncompressedHash(filePath)
+	}
+
+	// 如果不是gzip文件，计算原始内容的哈希值
+	if _, err := file.Seek(0, 0); err != nil {
+		return "", fmt.Errorf("重置文件指针失败: %v", err)
+	}
+
+	hash := sha256.New()
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	for {
+		n, err := file.Read(buf)
+		if n > 0 {
+			if _, err := hash.Write(buf[:n]); err != nil {
+				return "", fmt.Errorf("计算哈希失败: %v", err)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("读取文件失败: %v", err)
+		}
+	}
+
+	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
 }
