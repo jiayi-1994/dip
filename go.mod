@@ -1,3 +1,3 @@
 module github.com/docker-pull
 
-go 1.19
+go 1.23
