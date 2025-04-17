@@ -384,7 +384,7 @@ func tryRegistries(config Config, repository string, operation func(registry str
 			for _, mirror := range config.Mirrors {
 				if mirror == registry {
 					isMirror = true
-					fmt.Printf("成功使用镜像加速器: %s\n", registry)
+					// fmt.Printf("成功使用镜像加速器: %s\n", registry)
 					break
 				}
 			}
@@ -894,16 +894,31 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 			return fmt.Errorf("层文件无效: %v", err)
 		}
 
+		// 检查源文件是否为gzip文件
+		isGzip, err := isGzipFile(layerFile)
+		if err != nil {
+			return fmt.Errorf("检查源文件类型失败: %v", err)
+		}
+
+		// 如果是gzip文件，解压缩后再添加到tar
+		if isGzip {
+			uncompressedFile := filepath.Join(tempDir, fmt.Sprintf("uncompressed_%d.tar", i))
+			if err := uncompressGzipFile(layerFile, uncompressedFile); err != nil {
+				return fmt.Errorf("解压缩源文件失败: %v", err)
+			}
+			layerFile = uncompressedFile
+		}
+
 		// 添加层文件
 		layerTarPath := filepath.Join(layerID, "layer.tar")
 		if err := addFileToTar(tw, layerFile, layerTarPath); err != nil {
 			return fmt.Errorf("添加层文件失败: %v", err)
 		}
 
-		// 计算diffID
+		// 计算diff ID
 		diffID, err := calculateDiffID(layerFile)
 		if err != nil {
-			return fmt.Errorf("计算diffID失败: %v", err)
+			return fmt.Errorf("计算diff ID失败: %v", err)
 		}
 		diffIDs[i] = diffID
 
@@ -1532,4 +1547,51 @@ func formatDuration(d time.Duration) string {
 	}
 
 	return result
+}
+
+// 检查文件是否为gzip文件
+func isGzipFile(filePath string) (bool, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	// 读取前几个字节来检查gzip魔数
+	header := make([]byte, 2)
+	_, err = file.Read(header)
+	if err != nil {
+		return false, err
+	}
+
+	// 如果是gzip文件（魔数为1f 8b）
+	return header[0] == 0x1f && header[1] == 0x8b, nil
+}
+
+// 解压缩gzip文件
+func uncompressGzipFile(srcPath, dstPath string) error {
+	// 打开源文件
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	// 创建gzip reader
+	gr, err := gzip.NewReader(srcFile)
+	if err != nil {
+		return err
+	}
+	defer gr.Close()
+
+	// 创建目标文件
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	// 解压缩数据
+	_, err = io.Copy(dstFile, gr)
+	return err
 }
