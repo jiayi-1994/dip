@@ -161,19 +161,19 @@ func main() {
 
 	// 计算总耗时
 	totalDuration := time.Since(startTime)
-	
+
 	// 计算各阶段耗时
 	initDuration := initEndTime.Sub(startTime)
 	prepareDuration := prepareEndTime.Sub(initEndTime)
 	manifestDuration := manifestEndTime.Sub(manifestStartTime)
 	layersDuration := layersEndTime.Sub(layersStartTime)
 	tarDuration := tarEndTime.Sub(tarStartTime)
-	
+
 	// 计算其他操作耗时
 	otherDuration := totalDuration - (initDuration + prepareDuration + manifestDuration + layersDuration + tarDuration)
 
 	fmt.Printf("镜像已成功保存到: %s\n", outputFile)
-	
+
 	// 输出耗时统计信息
 	fmt.Println("\n耗时信息:")
 	fmt.Printf("  总耗时: %s\n", formatDuration(totalDuration))
@@ -198,7 +198,7 @@ func parseFlags() Config {
 	flag.StringVar(&config.CacheDir, "cache-dir", "", "层缓存目录 (默认: ~/.docker-pull/cache)")
 	flag.BoolVar(&config.Insecure, "k", false, "允许不安全的HTTPS连接")
 	flag.BoolVar(&config.ShowVersion, "version", false, "显示版本信息")
-	flag.IntVar(&config.Timeout, "timeout", 10, "HTTP超时时间（分钟）")
+	flag.IntVar(&config.Timeout, "timeout", 60*12, "HTTP超时时间（分钟）")
 	flag.IntVar(&config.Retries, "retries", 3, "下载重试次数")
 	flag.IntVar(&config.Concurrent, "concurrent", 5, "并发下载数量")
 
@@ -290,7 +290,7 @@ func parseImageName(imageName, defaultRegistry string) (registry, repository, ta
 func createHTTPClient(insecure bool, timeout int) *http.Client {
 	// 创建传输配置
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure},
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		MaxConnsPerHost:     50,
@@ -711,7 +711,7 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 
 		// 发送请求
 		var resp *http.Response
-		maxRetries := retries // 最大重试次数
+		maxRetries := retries         // 最大重试次数
 		retryDelay := 2 * time.Second // 重试延迟
 
 		// 使用重试机制
@@ -809,7 +809,7 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 							shortDigest = digest[7:19] // 取sha256:后的12位
 						}
 						progress := float64(downloaded) / float64(totalSize) * 100
-						fmt.Printf("\r[层 %s] 下载进度: %.1f%% | %.2f MB/%.2f MB | %.2f MB/s | 剩余时间: %v      ", 
+						fmt.Printf("\r[层 %s] 下载进度: %.1f%% | %.2f MB/%.2f MB | %.2f MB/s | 剩余时间: %v      ",
 							shortDigest,
 							progress,
 							float64(downloaded)/(1024*1024),
@@ -1513,7 +1513,7 @@ func calculateDiffID(filePath string) (string, error) {
 		if _, err := file.Seek(0, 0); err != nil {
 			return "", fmt.Errorf("重置文件指针失败: %v", err)
 		}
-		
+
 		// 创建gzip reader
 		gr, err := gzip.NewReader(file)
 		if err != nil {
