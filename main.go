@@ -732,14 +732,15 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 		var currentHash string
 
 		// 创建缓冲读取器
-		buf := make([]byte, 1024*1024) // 1MB 缓冲区，提高吞吐量
+		buf := make([]byte, 1024*1024) // 1MB buffer
+		teeReader := io.TeeReader(resp.Body, partialHash)
 
 		// 使用匿名函数确保资源正确释放
 		err = func() error {
 			defer file.Close()
 
 			for {
-				n, err := resp.Body.Read(buf)
+				n, err := teeReader.Read(buf)
 				if n > 0 {
 					// 写入文件
 					if _, err := file.Write(buf[:n]); err != nil {
@@ -747,7 +748,6 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 					}
 
 					// 更新哈希
-					partialHash.Write(buf[:n])
 					downloaded += int64(n)
 
 					// 每100ms更新一次进度显示
@@ -1447,12 +1447,68 @@ func calculateDiffID(filePath string) (string, error) {
 	}
 	defer file.Close()
 
-	// 创建哈希计算器
-	hash := sha256.New()
+	// 读取前几个字节来检查gzip魔数
+	header := make([]byte, 2)
+	if _, err := file.Read(header); err != nil {
+		return "", fmt.Errorf("读取文件头失败: %v", err)
+	}
 
-	// 复制文件内容到哈希计算器
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", fmt.Errorf("读取文件失败: %v", err)
+	// 如果是gzip文件（魔数为1f 8b）
+	if header[0] == 0x1f && header[1] == 0x8b {
+		// 重置文件指针
+		if _, err := file.Seek(0, 0); err != nil {
+			return "", fmt.Errorf("重置文件指针失败: %v", err)
+		}
+		
+		// 创建gzip reader
+		gr, err := gzip.NewReader(file)
+		if err != nil {
+			return "", fmt.Errorf("创建gzip reader失败: %v", err)
+		}
+		defer gr.Close()
+
+		// 计算解压缩后内容的哈希值
+		hash := sha256.New()
+		buf := make([]byte, 1024*1024) // 1MB buffer
+		for {
+			n, err := gr.Read(buf)
+			if n > 0 {
+				if _, err := hash.Write(buf[:n]); err != nil {
+					return "", fmt.Errorf("计算哈希失败: %v", err)
+				}
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return "", fmt.Errorf("读取解压缩数据失败: %v", err)
+			}
+		}
+
+		return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+	}
+
+	// 如果不是gzip文件，重置文件指针并计算原始内容的哈希值
+	if _, err := file.Seek(0, 0); err != nil {
+		return "", fmt.Errorf("重置文件指针失败: %v", err)
+	}
+
+	// 计算文件内容的哈希值
+	hash := sha256.New()
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	for {
+		n, err := file.Read(buf)
+		if n > 0 {
+			if _, err := hash.Write(buf[:n]); err != nil {
+				return "", fmt.Errorf("计算哈希失败: %v", err)
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("读取文件失败: %v", err)
+		}
 	}
 
 	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
