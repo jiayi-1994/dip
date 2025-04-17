@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 )
@@ -435,7 +434,7 @@ func getManifest(client *http.Client, registry, repository, tag, auth string, ar
 	ignoreRegistry := []string{"registry-1.docker.io", "docker.io", "ghcr.io", "k8s.gcr.io", "registry.k8s.io", "quay.io", "mcr.microsoft.com", "docker.elastic.co", "nvcr.io", "gcr.io"}
 
 	// 检查是否需要使用加速器
-	if slices.Contains(ignoreRegistry, registry) {
+	if contains(ignoreRegistry, registry) {
 		config.Mirrors = mirrors
 	}
 
@@ -445,6 +444,15 @@ func getManifest(client *http.Client, registry, repository, tag, auth string, ar
 	}
 
 	return result.(map[string]interface{}), nil
+}
+
+func contains(slice []string, str string) bool {
+	for _, v := range slice {
+		if v == str {
+			return true
+		}
+	}
+	return false
 }
 
 // 下载镜像层
