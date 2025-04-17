@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,9 @@ type Config struct {
 	Arch        string
 	CacheDir    string   // 添加缓存目录配置
 	Mirrors     []string // 镜像加速器列表
+	Timeout     int      // HTTP超时时间（分钟）
+	Retries     int      // 下载重试次数
+	Concurrent  int      // 并发下载数量
 }
 
 // RegistryConfig 保存镜像仓库配置
@@ -64,6 +68,9 @@ type DownloadState struct {
 
 // 主函数
 func main() {
+	// 记录开始时间
+	startTime := time.Now()
+
 	config := parseFlags()
 
 	if config.ShowVersion {
@@ -88,10 +95,13 @@ func main() {
 	}
 
 	// 创建HTTP客户端
-	client := createHTTPClient(config.Insecure)
+	client := createHTTPClient(config.Insecure, config.Timeout)
 
 	// 获取认证信息
 	auth := getAuthToken(client, registry, repository, config.Username, config.Password)
+
+	// 记录获取清单开始时间
+	manifestStartTime := time.Now()
 
 	// 获取镜像清单
 	manifest, err := getManifest(client, registry, repository, tag, auth, config.Arch, config.Mirrors)
@@ -99,6 +109,9 @@ func main() {
 		fmt.Printf("获取镜像清单失败: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 记录获取清单结束时间
+	manifestEndTime := time.Now()
 
 	// 创建临时目录
 	tempDir, err := os.MkdirTemp("", "docker-pull-*")
@@ -108,18 +121,27 @@ func main() {
 	}
 	defer os.RemoveAll(tempDir)
 
+	// 记录下载层开始时间
+	layersStartTime := time.Now()
+
 	// 下载镜像层
-	layers, err := downloadLayers(client, registry, repository, manifest, auth, tempDir, config.Mirrors)
+	layers, err := downloadLayers(client, registry, repository, manifest, auth, tempDir, config.Mirrors, config.Retries, config.Concurrent)
 	if err != nil {
 		fmt.Printf("下载镜像层失败: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 记录下载层结束时间
+	layersEndTime := time.Now()
 
 	// 生成输出文件名
 	outputFile := config.Output
 	if outputFile == "" {
 		outputFile = fmt.Sprintf("%s-%s-%s.tar", strings.ReplaceAll(repository, "/", "_"), tag, config.Arch)
 	}
+
+	// 记录创建tar文件开始时间
+	tarStartTime := time.Now()
 
 	// 创建tar文件
 	err = createTarFile(outputFile, manifest, layers, repository, tag)
@@ -128,7 +150,25 @@ func main() {
 		return
 	}
 
+	// 记录创建tar文件结束时间
+	tarEndTime := time.Now()
+
+	// 计算总耗时
+	totalDuration := time.Since(startTime)
+
+	// 计算各阶段耗时
+	manifestDuration := manifestEndTime.Sub(manifestStartTime)
+	layersDuration := layersEndTime.Sub(layersStartTime)
+	tarDuration := tarEndTime.Sub(tarStartTime)
+
 	fmt.Printf("镜像已成功保存到: %s\n", outputFile)
+
+	// 显示耗时信息
+	fmt.Println("\n耗时信息:")
+	fmt.Printf("  总耗时: %s\n", formatDuration(totalDuration))
+	fmt.Printf("  获取清单: %s\n", formatDuration(manifestDuration))
+	fmt.Printf("  下载层: %s\n", formatDuration(layersDuration))
+	fmt.Printf("  创建tar文件: %s\n", formatDuration(tarDuration))
 }
 
 // 解析命令行参数
@@ -144,6 +184,9 @@ func parseFlags() Config {
 	flag.StringVar(&config.CacheDir, "cache-dir", "", "层缓存目录 (默认: ~/.docker-pull/cache)")
 	flag.BoolVar(&config.Insecure, "k", false, "允许不安全的HTTPS连接")
 	flag.BoolVar(&config.ShowVersion, "version", false, "显示版本信息")
+	flag.IntVar(&config.Timeout, "timeout", 10, "HTTP超时时间（分钟）")
+	flag.IntVar(&config.Retries, "retries", 3, "下载重试次数")
+	flag.IntVar(&config.Concurrent, "concurrent", 5, "并发下载数量")
 
 	// 添加镜像加速器支持
 	var mirrors string
@@ -161,6 +204,9 @@ func parseFlags() Config {
 		fmt.Fprintf(os.Stderr, "  -k, --insecure\t\t允许不安全的HTTPS连接\n")
 		fmt.Fprintf(os.Stderr, "  -m, --mirrors string\t\t镜像加速器地址列表，多个地址用逗号分隔\n")
 		fmt.Fprintf(os.Stderr, "      --version\t\t\t显示版本信息\n")
+		fmt.Fprintf(os.Stderr, "      --timeout int\t\tHTTP超时时间（分钟） (默认: 10)\n")
+		fmt.Fprintf(os.Stderr, "      --retries int\t\t下载重试次数 (默认: 3)\n")
+		fmt.Fprintf(os.Stderr, "      --concurrent int\t\t并发下载数量 (默认: 5)\n")
 	}
 
 	flag.Parse()
@@ -227,16 +273,21 @@ func parseImageName(imageName, defaultRegistry string) (registry, repository, ta
 }
 
 // 创建HTTP客户端
-func createHTTPClient(insecure bool) *http.Client {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: insecure,
-		},
-		DisableCompression: false,
+func createHTTPClient(insecure bool, timeout int) *http.Client {
+	// 创建传输配置
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		MaxConnsPerHost:     50,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  false,
 	}
+
+	// 创建客户端
 	return &http.Client{
-		Transport: tr,
-		Timeout:   60 * time.Second,
+		Transport: transport,
+		Timeout:   time.Duration(timeout) * time.Minute, // 增加超时时间
 	}
 }
 
@@ -456,7 +507,7 @@ func contains(slice []string, str string) bool {
 }
 
 // 下载镜像层
-func downloadLayers(client *http.Client, registry, repository string, manifest map[string]interface{}, auth, tempDir string, mirrors []string) ([]string, error) {
+func downloadLayers(client *http.Client, registry, repository string, manifest map[string]interface{}, auth, tempDir string, mirrors []string, retries, concurrent int) ([]string, error) {
 	var layers []interface{}
 
 	// 获取缓存目录
@@ -491,10 +542,21 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 		return nil, fmt.Errorf("无效的manifest格式或未找到层信息")
 	}
 
-	layerFiles := make([]string, 0, len(layers))
+	// 计算层数量
+	layerCount := len(layers)
+	layerFiles := make([]string, layerCount)
 
-	fmt.Printf("开始下载 %d 个镜像层...\n", len(layers))
+	fmt.Printf("开始下载 %d 个镜像层...\n", layerCount)
 
+	// 并发下载层
+	errChan := make(chan error, layerCount)
+	var wg sync.WaitGroup
+
+	// 最大并发数
+	maxConcurrent := concurrent
+	semaphore := make(chan struct{}, maxConcurrent)
+
+	// 下载每个层
 	for i, layer := range layers {
 		layerInfo, ok := layer.(map[string]interface{})
 		if !ok {
@@ -509,28 +571,53 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 		// 检查缓存
 		if cacheDir != "" {
 			if cachedFile, exists := checkLayerCache(cacheDir, digest); exists {
-				fmt.Printf("层 %d/%d: %s 从缓存中获取\n", i+1, len(layers), digest)
-				layerFiles = append(layerFiles, cachedFile)
+				fmt.Printf("层 %d/%d: %s 从缓存中获取\n", i+1, layerCount, digest)
+				layerFiles[i] = cachedFile
 				continue
 			}
 		}
 
-		fmt.Printf("下载层 %d/%d: %s\n", i+1, len(layers), digest)
+		// 并发下载层
+		wg.Add(1)
+		go func(index int, digest string) {
+			defer wg.Done()
 
-		// 下载层
-		layerFile, err := downloadLayer(client, registry, repository, digest, auth, tempDir, cacheDir, mirrors)
+			// 等待信号量
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			fmt.Printf("下载层 %d/%d: %s\n", index+1, layerCount, digest)
+
+			// 下载层
+			layerFile, err := downloadLayer(client, registry, repository, digest, auth, tempDir, cacheDir, mirrors, retries)
+			if err != nil {
+				errChan <- fmt.Errorf("下载层 %d/%d (%s) 失败: %v", index+1, layerCount, digest, err)
+				return
+			}
+
+			// 保存层文件
+			layerFiles[index] = layerFile
+		}(i, digest)
+	}
+
+	// 等待所有goroutine完成
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	// 检查是否有错误
+	for err := range errChan {
 		if err != nil {
 			return nil, err
 		}
-
-		layerFiles = append(layerFiles, layerFile)
 	}
 
 	return layerFiles, nil
 }
 
 // downloadLayer 下载单个镜像层
-func downloadLayer(client *http.Client, registry, repository, digest, auth, tempDir, cacheDir string, mirrors []string) (string, error) {
+func downloadLayer(client *http.Client, registry, repository, digest, auth, tempDir, cacheDir string, mirrors []string, retries int) (string, error) {
 	operation := func(registry string) (interface{}, error) {
 		url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, digest)
 
@@ -584,10 +671,33 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 		}
 
 		// 发送请求
-		resp, err := client.Do(req)
-		if err != nil {
-			return "", err
+		var resp *http.Response
+		maxRetries := retries // 最大重试次数
+		retryDelay := 2 * time.Second // 重试延迟
+
+		// 使用重试机制
+		for retryCount := 0; retryCount <= maxRetries; retryCount++ {
+			if retryCount > 0 {
+				fmt.Printf("\n重试下载 (%d/%d): %s\n", retryCount, maxRetries, digest)
+				// 等待重试延迟
+				time.Sleep(retryDelay)
+				retryDelay *= 2 // 增加重试延迟
+			}
+
+			resp, err = client.Do(req)
+			if err == nil {
+				// 请求成功
+				break
+			}
+
+			// 如果达到最大重试次数，返回错误
+			if retryCount == maxRetries {
+				return "", err
+			}
+
+			fmt.Printf("下载失败: %v\n", err)
 		}
+
 		defer resp.Body.Close()
 
 		// 检查响应状态
@@ -622,7 +732,7 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 		var currentHash string
 
 		// 创建缓冲读取器
-		buf := make([]byte, 32*1024) // 32KB 缓冲区
+		buf := make([]byte, 1024*1024) // 1MB 缓冲区，提高吞吐量
 
 		// 使用匿名函数确保资源正确释放
 		err = func() error {
@@ -655,8 +765,13 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 						}
 
 						// 显示进度
+						shortDigest := digest
+						if len(digest) > 16 {
+							shortDigest = digest[7:19] // 取sha256:后的12位
+						}
 						progress := float64(downloaded) / float64(totalSize) * 100
-						fmt.Printf("\r下载进度: %.1f%% | %.2f MB/%.2f MB | %.2f MB/s | 剩余时间: %v",
+						fmt.Printf("\r[层 %s] 下载进度: %.1f%% | %.2f MB/%.2f MB | %.2f MB/s | 剩余时间: %v      ", 
+							shortDigest,
 							progress,
 							float64(downloaded)/(1024*1024),
 							float64(totalSize)/(1024*1024),
@@ -729,10 +844,12 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 		Registry: registry,
 		Mirrors:  []string{}, // 默认不使用加速器
 	}
-	// ignoreRegistry := []string{"ghcr.io", "k8s.gcr.io", "registry.k8s.io", "quay.io", "mcr.microsoft.com", "docker.elastic.co", "nvcr.io", "gcr.io"}
 
-	// 只有当使用 Docker Hub 时才使用加速器
-	if registry == "registry-1.docker.io" {
+	// 定义需要使用加速器的仓库列表
+	acceleratedRegistry := []string{"registry-1.docker.io", "docker.io", "index.docker.io"}
+
+	// 检查是否需要使用加速器
+	if contains(acceleratedRegistry, registry) {
 		config.Mirrors = mirrors
 	}
 
@@ -898,12 +1015,13 @@ func addFileToTar(tw *tar.Writer, filePath, tarPath string) error {
 		return fmt.Errorf("写入tar头部失败: %v", err)
 	}
 
-	// 使用缓冲读取
+	// 使用缓冲写入
 	buf := make([]byte, 1024*1024) // 1MB buffer
 	written := int64(0)
 	for {
 		n, err := file.Read(buf)
 		if n > 0 {
+			// 写入文件
 			nw, err := tw.Write(buf[:n])
 			if err != nil {
 				return fmt.Errorf("写入tar内容失败: %v", err)
@@ -1215,7 +1333,7 @@ func compressFileAndCalculateDiffID(srcPath, dstPath string) (string, error) {
 	// 打开源文件
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
-		return "", fmt.Errorf("打开源文件失败: %v", err)
+		return "", fmt.Errorf("打开文件失败: %v", err)
 	}
 	defer srcFile.Close()
 
@@ -1255,6 +1373,7 @@ func compressFileAndCalculateDiffID(srcPath, dstPath string) (string, error) {
 	for {
 		n, err := teeReader.Read(buf)
 		if n > 0 {
+			// 写入文件
 			if _, err := gw.Write(buf[:n]); err != nil {
 				return "", fmt.Errorf("写入压缩数据失败: %v", err)
 			}
@@ -1321,45 +1440,40 @@ func calculateUncompressedHash(gzipFile string) (string, error) {
 
 // 计算文件的 diff ID
 func calculateDiffID(filePath string) (string, error) {
-	// 检查文件是否为gzip格式
+	// 打开文件
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("打开文件失败: %v", err)
 	}
 	defer file.Close()
 
-	// 读取前几个字节来检查gzip魔数
-	header := make([]byte, 2)
-	if _, err := file.Read(header); err != nil {
-		return "", fmt.Errorf("读取文件头失败: %v", err)
-	}
-
-	// 如果是gzip文件（魔数为1f 8b）
-	if header[0] == 0x1f && header[1] == 0x8b {
-		return calculateUncompressedHash(filePath)
-	}
-
-	// 如果不是gzip文件，计算原始内容的哈希值
-	if _, err := file.Seek(0, 0); err != nil {
-		return "", fmt.Errorf("重置文件指针失败: %v", err)
-	}
-
+	// 创建哈希计算器
 	hash := sha256.New()
-	buf := make([]byte, 1024*1024) // 1MB buffer
-	for {
-		n, err := file.Read(buf)
-		if n > 0 {
-			if _, err := hash.Write(buf[:n]); err != nil {
-				return "", fmt.Errorf("计算哈希失败: %v", err)
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("读取文件失败: %v", err)
-		}
+
+	// 复制文件内容到哈希计算器
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("读取文件失败: %v", err)
 	}
 
 	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+}
+
+// 格式化时间
+func formatDuration(d time.Duration) string {
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	var result string
+	if hours > 0 {
+		result += fmt.Sprintf("%d小时", hours)
+	}
+	if minutes > 0 {
+		result += fmt.Sprintf("%d分钟", minutes)
+	}
+	if seconds > 0 || result == "" {
+		result += fmt.Sprintf("%d秒", seconds)
+	}
+
+	return result
 }
