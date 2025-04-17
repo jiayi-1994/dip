@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Docker镜像拉取工具</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Docker镜像拉取工具</h1>
+        <div class="form-container">
+            <div class="form-group">
+                <label for="image">Docker镜像名称:</label>
+                <input type="text" id="image" placeholder="例如: nginx:latest">
+            </div>
+            <div class="form-group">
+                <label for="output">输出文件名:</label>
+                <input type="text" id="output" placeholder="例如: nginx.tar">
+            </div>
+            <div class="form-group">
+                <label for="registry">Registry地址:</label>
+                <input type="text" id="registry" value="registry-1.docker.io">
+            </div>
+            <div class="form-group">
+                <label for="arch">架构:</label>
+                <select id="arch">
+                    <option value="amd64">amd64</option>
+                    <option value="arm64">arm64</option>
+                    <option value="arm">arm</option>
+                    <option value="386">386</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="mirrors">镜像加速器:</label>
+                <input type="text" id="mirrors" value="docker.gh-proxy.com,docker.1ms.run,docker.xjyi.me">
+            </div>
+            <div class="form-group checkbox">
+                <input type="checkbox" id="insecure">
+                <label for="insecure">允许不安全的HTTPS连接</label>
+            </div>
+            <div class="form-actions">
+                <button id="pull-btn" onclick="pullImage()">拉取镜像</button>
+            </div>
+        </div>
+        <div class="result-container" id="result-container" style="display: none;">
+            <h2>拉取结果</h2>
+            <pre id="result-output"></pre>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>

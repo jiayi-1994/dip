@@ -1,6 +1,7 @@
 .idea
 .vscode
 .DS_Store
+.windsurfrules
 
 # Binaries for programs and plugins
 *.exe
