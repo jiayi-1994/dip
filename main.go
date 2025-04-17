@@ -68,7 +68,7 @@ type DownloadState struct {
 
 // 主函数
 func main() {
-	// 记录开始时间
+	// 记录程序开始时间
 	startTime := time.Now()
 
 	config := parseFlags()
@@ -84,6 +84,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 记录初始化结束时间
+	initEndTime := time.Now()
+
 	// 解析镜像名称
 	registry, repository, tag := parseImageName(config.Image, config.Registry)
 
@@ -98,7 +101,10 @@ func main() {
 	client := createHTTPClient(config.Insecure, config.Timeout)
 
 	// 获取认证信息
-	auth := getAuthToken(client, registry, repository, config.Username, config.Password)
+	auth := getAuthToken(client, registry, repository, config.Username, config.Password, config.Mirrors)
+
+	// 记录准备工作结束时间
+	prepareEndTime := time.Now()
 
 	// 记录获取清单开始时间
 	manifestStartTime := time.Now()
@@ -155,20 +161,28 @@ func main() {
 
 	// 计算总耗时
 	totalDuration := time.Since(startTime)
-
+	
 	// 计算各阶段耗时
+	initDuration := initEndTime.Sub(startTime)
+	prepareDuration := prepareEndTime.Sub(initEndTime)
 	manifestDuration := manifestEndTime.Sub(manifestStartTime)
 	layersDuration := layersEndTime.Sub(layersStartTime)
 	tarDuration := tarEndTime.Sub(tarStartTime)
+	
+	// 计算其他操作耗时
+	otherDuration := totalDuration - (initDuration + prepareDuration + manifestDuration + layersDuration + tarDuration)
 
 	fmt.Printf("镜像已成功保存到: %s\n", outputFile)
-
-	// 显示耗时信息
+	
+	// 输出耗时统计信息
 	fmt.Println("\n耗时信息:")
 	fmt.Printf("  总耗时: %s\n", formatDuration(totalDuration))
+	fmt.Printf("  初始化: %s\n", formatDuration(initDuration))
+	fmt.Printf("  准备工作: %s\n", formatDuration(prepareDuration))
 	fmt.Printf("  获取清单: %s\n", formatDuration(manifestDuration))
-	fmt.Printf("  下载层: %s\n", formatDuration(layersDuration))
+	fmt.Printf("  下载镜像层: %s\n", formatDuration(layersDuration))
 	fmt.Printf("  创建tar文件: %s\n", formatDuration(tarDuration))
+	fmt.Printf("  其他操作: %s\n", formatDuration(otherDuration))
 }
 
 // 解析命令行参数
@@ -292,13 +306,38 @@ func createHTTPClient(insecure bool, timeout int) *http.Client {
 }
 
 // 获取认证令牌
-func getAuthToken(client *http.Client, registry, repository, username, password string) string {
+func getAuthToken(client *http.Client, registry, repository, username, password string, mirrors []string) string {
 	// 如果提供了用户名和密码，先尝试Basic认证
 	if username != "" && password != "" {
 		auth := fmt.Sprintf("%s:%s", username, password)
 		return "Basic " + base64Encode(auth)
 	}
 
+	// 定义Docker Hub相关域名
+	acceleratedRegistry := []string{
+		"registry-1.docker.io",
+		"docker.io",
+		"index.docker.io",
+	}
+
+	// 如果是Docker Hub，尝试使用镜像加速器
+	if contains(acceleratedRegistry, registry) && len(mirrors) > 0 {
+		// 尝试每个镜像加速器
+		for _, mirror := range mirrors {
+			// 尝试使用镜像加速器获取认证令牌
+			if token := tryGetAuthToken(client, mirror, repository, username, password); token != "" {
+				fmt.Printf("成功使用镜像加速器获取认证令牌: %s\n", mirror)
+				return token
+			}
+		}
+	}
+
+	// 如果镜像加速器失败或不是Docker Hub，使用原始仓库
+	return tryGetAuthToken(client, registry, repository, username, password)
+}
+
+// 尝试从镜像仓库获取认证令牌
+func tryGetAuthToken(client *http.Client, registry, repository, username, password string) string {
 	// 尝试获取token认证
 	authURL := fmt.Sprintf("https://%s/v2/", registry)
 	req, err := http.NewRequest("GET", authURL, nil)
@@ -780,7 +819,7 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 
 						// 更新下载状态
 						currentHash = fmt.Sprintf("%x", partialHash.Sum(nil))
-						state = &DownloadState{
+						state := &DownloadState{
 							LayerDigest:  digest,
 							Downloaded:   downloaded,
 							TotalSize:    totalSize,
