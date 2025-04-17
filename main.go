@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -30,7 +31,27 @@ type Config struct {
 	Insecure    bool
 	ShowVersion bool
 	Arch        string
-	CacheDir    string // 添加缓存目录配置
+	CacheDir    string   // 添加缓存目录配置
+	Mirrors     []string // 镜像加速器列表
+}
+
+// RegistryConfig 保存镜像仓库配置
+type RegistryConfig struct {
+	URL      string // 仓库地址
+	Username string // 用户名
+	Password string // 密码
+	Insecure bool   // 是否允许不安全连接
+}
+
+// RegistryError 表示镜像仓库操作错误
+type RegistryError struct {
+	Registry string // 仓库地址
+	Op       string // 操作类型
+	Err      error  // 原始错误
+}
+
+func (e *RegistryError) Error() string {
+	return fmt.Sprintf("registry %s: %s failed: %v", e.Registry, e.Op, e.Err)
 }
 
 // DownloadState 保存下载状态
@@ -60,7 +81,12 @@ func main() {
 	// 解析镜像名称
 	registry, repository, tag := parseImageName(config.Image, config.Registry)
 
-	fmt.Printf("开始拉取镜像: %s:%s 从 %s\n", repository, tag, registry)
+	// 显示配置信息
+	fmt.Printf("开始拉取镜像: %s:%s\n", repository, tag)
+	fmt.Printf("默认仓库: %s\n", registry)
+	if len(config.Mirrors) > 0 {
+		fmt.Printf("配置的镜像加速器: %s\n", strings.Join(config.Mirrors, ", "))
+	}
 
 	// 创建HTTP客户端
 	client := createHTTPClient(config.Insecure)
@@ -69,7 +95,7 @@ func main() {
 	auth := getAuthToken(client, registry, repository, config.Username, config.Password)
 
 	// 获取镜像清单
-	manifest, err := getManifest(client, registry, repository, tag, auth, config.Arch)
+	manifest, err := getManifest(client, registry, repository, tag, auth, config.Arch, config.Mirrors)
 	if err != nil {
 		fmt.Printf("获取镜像清单失败: %v\n", err)
 		os.Exit(1)
@@ -84,7 +110,7 @@ func main() {
 	defer os.RemoveAll(tempDir)
 
 	// 下载镜像层
-	layers, err := downloadLayers(client, registry, repository, manifest, auth, tempDir)
+	layers, err := downloadLayers(client, registry, repository, manifest, auth, tempDir, config.Mirrors)
 	if err != nil {
 		fmt.Printf("下载镜像层失败: %v\n", err)
 		os.Exit(1)
@@ -110,22 +136,19 @@ func main() {
 func parseFlags() Config {
 	config := Config{}
 
-	flag.StringVar(&config.Image, "image", "", "Docker镜像名称 (格式: [registry/]repository[:tag])")
 	flag.StringVar(&config.Image, "i", "", "Docker镜像名称 (格式: [registry/]repository[:tag])")
-	flag.StringVar(&config.Output, "output", "", "输出文件路径 (默认: repository-tag.tar)")
 	flag.StringVar(&config.Output, "o", "", "输出文件路径 (默认: repository-tag.tar)")
-	flag.StringVar(&config.Registry, "registry", "registry-1.docker.io", "Docker Registry地址")
 	flag.StringVar(&config.Registry, "r", "registry-1.docker.io", "Docker Registry地址")
-	flag.StringVar(&config.Username, "username", "", "Registry用户名")
 	flag.StringVar(&config.Username, "u", "", "Registry用户名")
-	flag.StringVar(&config.Password, "password", "", "Registry密码")
 	flag.StringVar(&config.Password, "p", "", "Registry密码")
-	flag.StringVar(&config.Arch, "arch", "amd64", "镜像架构 (例如: amd64, arm64)")
 	flag.StringVar(&config.Arch, "a", "amd64", "镜像架构 (例如: amd64, arm64)")
 	flag.StringVar(&config.CacheDir, "cache-dir", "", "层缓存目录 (默认: ~/.docker-pull/cache)")
-	flag.BoolVar(&config.Insecure, "insecure", false, "允许不安全的HTTPS连接")
 	flag.BoolVar(&config.Insecure, "k", false, "允许不安全的HTTPS连接")
 	flag.BoolVar(&config.ShowVersion, "version", false, "显示版本信息")
+
+	// 添加镜像加速器支持
+	var mirrors string
+	flag.StringVar(&mirrors, "m", "docker.gh-proxy.com,docker.1ms.run,docker.xjyi.me", "镜像加速器地址列表，多个地址用逗号分隔")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法: docker-pull [选项]\n\n选项:\n")
@@ -137,10 +160,29 @@ func parseFlags() Config {
 		fmt.Fprintf(os.Stderr, "  -a, --arch string\t\t镜像架构 (例如: amd64, arm64) (默认: amd64)\n")
 		fmt.Fprintf(os.Stderr, "      --cache-dir string\t\t层缓存目录 (默认: ~/.docker-pull/cache)\n")
 		fmt.Fprintf(os.Stderr, "  -k, --insecure\t\t允许不安全的HTTPS连接\n")
+		fmt.Fprintf(os.Stderr, "  -m, --mirrors string\t\t镜像加速器地址列表，多个地址用逗号分隔\n")
 		fmt.Fprintf(os.Stderr, "      --version\t\t\t显示版本信息\n")
 	}
 
 	flag.Parse()
+
+	// 处理镜像加速器配置
+	if mirrors != "" {
+		config.Mirrors = strings.Split(mirrors, ",")
+		// 去除空白字符
+		for i := range config.Mirrors {
+			config.Mirrors[i] = strings.TrimSpace(config.Mirrors[i])
+		}
+	}
+
+	// 检查环境变量中的镜像加速器配置
+	if envMirrors := os.Getenv("DOCKER_PULL_MIRRORS"); envMirrors != "" && len(config.Mirrors) == 0 {
+		config.Mirrors = strings.Split(envMirrors, ",")
+		for i := range config.Mirrors {
+			config.Mirrors[i] = strings.TrimSpace(config.Mirrors[i])
+		}
+	}
+
 	return config
 }
 
@@ -271,78 +313,142 @@ func base64Encode(data string) string {
 	return base64.StdEncoding.EncodeToString([]byte(data))
 }
 
-// 获取镜像清单
-func getManifest(client *http.Client, registry, repository, tag, auth string, arch string) (map[string]interface{}, error) {
-	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, tag)
+// tryRegistries 尝试对多个镜像仓库执行操作，直到成功或全部失败
+func tryRegistries(config Config, repository string, operation func(registry string) (interface{}, error)) (interface{}, error) {
+	var lastErr error
+	registries := []string{}
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
+	// 首先尝试镜像加速器
+	if len(config.Mirrors) > 0 {
+		registries = append(registries, config.Mirrors...)
 	}
 
-	// 添加认证头
-	if auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
+	// 最后尝试原始仓库
+	registries = append(registries, config.Registry)
 
-	// 支持多种manifest格式
-	req.Header.Set("Accept", strings.Join([]string{
-		"application/vnd.docker.distribution.manifest.v2+json",
-		"application/vnd.docker.distribution.manifest.v1+json",
-		"application/vnd.docker.distribution.manifest.list.v2+json",
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/vnd.oci.image.index.v1+json",
-	}, ","))
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("获取清单失败，状态码: %d", resp.StatusCode)
-	}
-
-	var manifest map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-		return nil, err
-	}
-
-	// 处理manifest列表
-	if mediaType, ok := manifest["mediaType"].(string); ok {
-		if strings.Contains(mediaType, "manifest.list") || strings.Contains(mediaType, "index.v1") {
-			// 从manifest列表中选择合适的manifest
-			manifests, ok := manifest["manifests"].([]interface{})
-			if !ok {
-				return nil, fmt.Errorf("无效的manifest列表格式")
-			}
-
-			// 查找指定架构的manifest
-			for _, m := range manifests {
-				if mf, ok := m.(map[string]interface{}); ok {
-					platform, ok := mf["platform"].(map[string]interface{})
-					if !ok {
-						continue
-					}
-
-					// 使用传入的arch参数
-					if platform["architecture"] == arch && platform["os"] == "linux" {
-						// 获取具体的manifest
-						digest := mf["digest"].(string)
-						return getManifest(client, registry, repository, digest, auth, arch)
-					}
+	for _, registry := range registries {
+		result, err := operation(registry)
+		if err == nil {
+			// 判断是否使用了加速器
+			isMirror := false
+			for _, mirror := range config.Mirrors {
+				if mirror == registry {
+					isMirror = true
+					fmt.Printf("成功使用镜像加速器: %s\n", registry)
+					break
 				}
 			}
-			return nil, fmt.Errorf("未找到架构为 %s 的manifest", arch)
+			if !isMirror {
+				fmt.Printf("成功使用原始仓库: %s\n", registry)
+			}
+			return result, nil
 		}
+		lastErr = &RegistryError{
+			Registry: registry,
+			Op:       "registry operation",
+			Err:      err,
+		}
+		fmt.Printf("警告: 从 %s 拉取失败: %v，尝试下一个地址\n", registry, err)
 	}
 
-	return manifest, nil
+	return nil, fmt.Errorf("所有镜像仓库都失败: %v", lastErr)
+}
+
+// getManifest 获取镜像清单
+func getManifest(client *http.Client, registry, repository, tag, auth string, arch string, mirrors []string) (map[string]interface{}, error) {
+	operation := func(registry string) (interface{}, error) {
+		url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repository, tag)
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		// 添加认证头
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+
+		// 支持多种manifest格式
+		req.Header.Set("Accept", strings.Join([]string{
+			"application/vnd.docker.distribution.manifest.v2+json",
+			"application/vnd.docker.distribution.manifest.v1+json",
+			"application/vnd.docker.distribution.manifest.list.v2+json",
+			"application/vnd.oci.image.manifest.v1+json",
+			"application/vnd.oci.image.index.v1+json",
+		}, ","))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("获取清单失败，状态码: %d", resp.StatusCode)
+		}
+
+		var manifest map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+			return nil, err
+		}
+
+		// 处理manifest列表
+		if mediaType, ok := manifest["mediaType"].(string); ok {
+			if strings.Contains(mediaType, "manifest.list") || strings.Contains(mediaType, "index.v1") {
+				// 从manifest列表中选择合适的manifest
+				manifests, ok := manifest["manifests"].([]interface{})
+				if !ok {
+					return nil, fmt.Errorf("无效的manifest列表格式")
+				}
+
+				// 查找指定架构的manifest
+				for _, m := range manifests {
+					if mf, ok := m.(map[string]interface{}); ok {
+						platform, ok := mf["platform"].(map[string]interface{})
+						if !ok {
+							continue
+						}
+
+						// 使用传入的arch参数
+						if platform["architecture"] == arch && platform["os"] == "linux" {
+							// 获取具体的manifest
+							digest := mf["digest"].(string)
+							return getManifest(client, registry, repository, digest, auth, arch, mirrors)
+						}
+					}
+				}
+				return nil, fmt.Errorf("未找到架构为 %s 的manifest", arch)
+			}
+		}
+
+		return manifest, nil
+	}
+
+	// 创建包含镜像加速器配置的 Config
+	config := Config{
+		Registry: registry,
+		Mirrors:  []string{}, // 默认不使用加速器
+	}
+
+	// 定义需要使用加速器的仓库列表
+	ignoreRegistry := []string{"registry-1.docker.io", "docker.io", "ghcr.io", "k8s.gcr.io", "registry.k8s.io", "quay.io", "mcr.microsoft.com", "docker.elastic.co", "nvcr.io", "gcr.io"}
+
+	// 检查是否需要使用加速器
+	if slices.Contains(ignoreRegistry, registry) {
+		config.Mirrors = mirrors
+	}
+
+	result, err := tryRegistries(config, repository, operation)
+	if err != nil {
+		return nil, err
+	}
+
+	return result.(map[string]interface{}), nil
 }
 
 // 下载镜像层
-func downloadLayers(client *http.Client, registry, repository string, manifest map[string]interface{}, auth, tempDir string) ([]string, error) {
+func downloadLayers(client *http.Client, registry, repository string, manifest map[string]interface{}, auth, tempDir string, mirrors []string) ([]string, error) {
 	var layers []interface{}
 
 	// 获取缓存目录
@@ -404,7 +510,7 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 		fmt.Printf("下载层 %d/%d: %s\n", i+1, len(layers), digest)
 
 		// 下载层
-		layerFile, err := downloadLayer(client, registry, repository, digest, auth, tempDir, cacheDir)
+		layerFile, err := downloadLayer(client, registry, repository, digest, auth, tempDir, cacheDir, mirrors)
 		if err != nil {
 			return nil, err
 		}
@@ -415,198 +521,219 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 	return layerFiles, nil
 }
 
-// 下载单个镜像层
-func downloadLayer(client *http.Client, registry, repository, digest, auth, tempDir, cacheDir string) (string, error) {
-	url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, digest)
+// downloadLayer 下载单个镜像层
+func downloadLayer(client *http.Client, registry, repository, digest, auth, tempDir, cacheDir string, mirrors []string) (string, error) {
+	operation := func(registry string) (interface{}, error) {
+		url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, digest)
 
-	// 如果提供了缓存目录，首先检查缓存
-	if cacheDir != "" {
-		if cachedFile, exists := checkLayerCache(cacheDir, digest); exists {
-			// 将缓存文件复制到临时目录
-			tempFile := filepath.Join(tempDir, strings.Replace(digest, ":", "_", 1))
-			if err := copyFile(cachedFile, tempFile); err != nil {
-				fmt.Printf("警告: 无法从缓存复制文件: %v，将重新下载\n", err)
-			} else {
-				return tempFile, nil
+		// 如果提供了缓存目录，首先检查缓存
+		if cacheDir != "" {
+			if cachedFile, exists := checkLayerCache(cacheDir, digest); exists {
+				// 将缓存文件复制到临时目录
+				tempFile := filepath.Join(tempDir, strings.Replace(digest, ":", "_", 1))
+				if err := copyFile(cachedFile, tempFile); err != nil {
+					fmt.Printf("警告: 无法从缓存复制文件: %v，将重新下载\n", err)
+				} else {
+					return tempFile, nil
+				}
 			}
 		}
-	}
 
-	layerFile := filepath.Join(tempDir, strings.Replace(digest, ":", "_", 1))
-	tempFile := layerFile + ".downloading"
+		layerFile := filepath.Join(tempDir, strings.Replace(digest, ":", "_", 1))
+		tempFile := layerFile + ".downloading"
 
-	// 尝试加载之前的下载状态
-	state, err := loadDownloadState(tempDir, digest)
-	if err != nil {
-		return "", fmt.Errorf("加载下载状态失败: %v", err)
-	}
-
-	var startOffset int64
-	var partialHash = sha256.New()
-
-	// 检查是否存在未完成的下载
-	if state != nil && verifyPartialDownload(tempFile, state) {
-		startOffset = state.Downloaded
-		fmt.Printf("发现未完成的下载，从 %.2f MB 处继续\n", float64(startOffset)/(1024*1024))
-	} else {
-		startOffset = 0
-	}
-
-	// 创建请求
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", err
-	}
-
-	// 添加认证头
-	if auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
-
-	// 如果有起始偏移，添加Range头
-	if startOffset > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
-	}
-
-	// 发送请求
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// 检查响应状态
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return "", fmt.Errorf("下载层失败，状态码: %d", resp.StatusCode)
-	}
-
-	// 获取文件总大小
-	var totalSize int64
-	if resp.StatusCode == http.StatusPartialContent {
-		totalSize = resp.ContentLength + startOffset
-	} else {
-		totalSize = resp.ContentLength
-	}
-
-	// 创建或打开文件
-	file, err := func() (*os.File, error) {
-		if startOffset > 0 {
-			return os.OpenFile(tempFile, os.O_APPEND|os.O_WRONLY, 0644)
+		// 尝试加载之前的下载状态
+		state, err := loadDownloadState(tempDir, digest)
+		if err != nil {
+			return "", fmt.Errorf("加载下载状态失败: %v", err)
 		}
-		return os.Create(tempFile)
-	}()
-	if err != nil {
-		return "", err
-	}
 
-	// 创建进度跟踪变量
-	downloaded := startOffset
-	startTime := time.Now()
-	lastUpdateTime := startTime
-	lastDownloaded := downloaded
-	var currentHash string
+		var startOffset int64
+		var partialHash = sha256.New()
 
-	// 创建缓冲读取器
-	buf := make([]byte, 32*1024) // 32KB 缓冲区
+		// 检查是否存在未完成的下载
+		if state != nil && verifyPartialDownload(tempFile, state) {
+			startOffset = state.Downloaded
+			fmt.Printf("发现未完成的下载，从 %.2f MB 处继续\n", float64(startOffset)/(1024*1024))
+		} else {
+			startOffset = 0
+		}
 
-	// 使用匿名函数确保资源正确释放
-	err = func() error {
-		defer file.Close()
+		// 创建请求
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return "", err
+		}
 
-		for {
-			n, err := resp.Body.Read(buf)
-			if n > 0 {
-				// 写入文件
-				if _, err := file.Write(buf[:n]); err != nil {
+		// 添加认证头
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+
+		// 如果有起始偏移，添加Range头
+		if startOffset > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
+		}
+
+		// 发送请求
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+
+		// 检查响应状态
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			return "", fmt.Errorf("下载层失败，状态码: %d", resp.StatusCode)
+		}
+
+		// 获取文件总大小
+		var totalSize int64
+		if resp.StatusCode == http.StatusPartialContent {
+			totalSize = resp.ContentLength + startOffset
+		} else {
+			totalSize = resp.ContentLength
+		}
+
+		// 创建或打开文件
+		file, err := func() (*os.File, error) {
+			if startOffset > 0 {
+				return os.OpenFile(tempFile, os.O_APPEND|os.O_WRONLY, 0644)
+			}
+			return os.Create(tempFile)
+		}()
+		if err != nil {
+			return "", err
+		}
+
+		// 创建进度跟踪变量
+		downloaded := startOffset
+		startTime := time.Now()
+		lastUpdateTime := startTime
+		lastDownloaded := downloaded
+		var currentHash string
+
+		// 创建缓冲读取器
+		buf := make([]byte, 32*1024) // 32KB 缓冲区
+
+		// 使用匿名函数确保资源正确释放
+		err = func() error {
+			defer file.Close()
+
+			for {
+				n, err := resp.Body.Read(buf)
+				if n > 0 {
+					// 写入文件
+					if _, err := file.Write(buf[:n]); err != nil {
+						return err
+					}
+
+					// 更新哈希
+					partialHash.Write(buf[:n])
+					downloaded += int64(n)
+
+					// 每100ms更新一次进度显示
+					now := time.Now()
+					if now.Sub(lastUpdateTime) >= 100*time.Millisecond {
+						// 计算下载速度
+						elapsed := now.Sub(lastUpdateTime).Seconds()
+						speed := float64(downloaded-lastDownloaded) / elapsed
+
+						// 计算剩余时间
+						var remainingTime time.Duration
+						if speed > 0 {
+							remaining := float64(totalSize-downloaded) / speed
+							remainingTime = time.Duration(remaining * float64(time.Second))
+						}
+
+						// 显示进度
+						progress := float64(downloaded) / float64(totalSize) * 100
+						fmt.Printf("\r下载进度: %.1f%% | %.2f MB/%.2f MB | %.2f MB/s | 剩余时间: %v",
+							progress,
+							float64(downloaded)/(1024*1024),
+							float64(totalSize)/(1024*1024),
+							speed/(1024*1024),
+							remainingTime.Round(time.Second))
+
+						// 更新下载状态
+						currentHash = fmt.Sprintf("%x", partialHash.Sum(nil))
+						state = &DownloadState{
+							LayerDigest:  digest,
+							Downloaded:   downloaded,
+							TotalSize:    totalSize,
+							LastModified: now,
+							PartialHash:  currentHash,
+						}
+						if err := saveDownloadState(*state, tempDir); err != nil {
+							fmt.Printf("\n警告: 保存下载状态失败: %v\n", err)
+						}
+
+						lastUpdateTime = now
+						lastDownloaded = downloaded
+					}
+				}
+
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
 					return err
 				}
-
-				// 更新哈希
-				partialHash.Write(buf[:n])
-				downloaded += int64(n)
-
-				// 每100ms更新一次进度显示
-				now := time.Now()
-				if now.Sub(lastUpdateTime) >= 100*time.Millisecond {
-					// 计算下载速度
-					elapsed := now.Sub(lastUpdateTime).Seconds()
-					speed := float64(downloaded-lastDownloaded) / elapsed
-
-					// 计算剩余时间
-					var remainingTime time.Duration
-					if speed > 0 {
-						remaining := float64(totalSize-downloaded) / speed
-						remainingTime = time.Duration(remaining * float64(time.Second))
-					}
-
-					// 显示进度
-					progress := float64(downloaded) / float64(totalSize) * 100
-					fmt.Printf("\r下载进度: %.1f%% | %.2f MB/%.2f MB | %.2f MB/s | 剩余时间: %v",
-						progress,
-						float64(downloaded)/(1024*1024),
-						float64(totalSize)/(1024*1024),
-						speed/(1024*1024),
-						remainingTime.Round(time.Second))
-
-					// 更新下载状态
-					currentHash = fmt.Sprintf("%x", partialHash.Sum(nil))
-					state = &DownloadState{
-						LayerDigest:  digest,
-						Downloaded:   downloaded,
-						TotalSize:    totalSize,
-						LastModified: now,
-						PartialHash:  currentHash,
-					}
-					if err := saveDownloadState(*state, tempDir); err != nil {
-						fmt.Printf("\n警告: 保存下载状态失败: %v\n", err)
-					}
-
-					lastUpdateTime = now
-					lastDownloaded = downloaded
-				}
 			}
 
-			if err == io.EOF {
-				break
+			// 确保所有数据都写入磁盘
+			return file.Sync()
+		}()
+
+		if err != nil {
+			return "", err
+		}
+
+		// 完成下载，清除进度显示并换行
+		fmt.Println()
+
+		// 重命名临时文件
+		if err := os.Rename(tempFile, layerFile); err != nil {
+			// 如果重命名失败，尝试复制
+			if err := copyFile(tempFile, layerFile); err != nil {
+				return "", fmt.Errorf("移动文件失败: %v", err)
 			}
-			if err != nil {
-				return err
+			os.Remove(tempFile)
+		}
+
+		// 如果提供了缓存目录，将文件复制到缓存
+		if cacheDir != "" {
+			cacheFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
+			if err := copyFile(layerFile, cacheFile); err != nil {
+				fmt.Printf("警告: 无法将文件复制到缓存: %v\n", err)
 			}
 		}
 
-		// 确保所有数据都写入磁盘
-		return file.Sync()
-	}()
+		// 清理状态文件
+		stateFile := getStateFilePath(tempDir, digest)
+		os.Remove(stateFile)
 
+		return layerFile, nil
+	}
+
+	// 创建包含镜像加速器配置的 Config
+	config := Config{
+		Registry: registry,
+		Mirrors:  []string{}, // 默认不使用加速器
+	}
+	// ignoreRegistry := []string{"ghcr.io", "k8s.gcr.io", "registry.k8s.io", "quay.io", "mcr.microsoft.com", "docker.elastic.co", "nvcr.io", "gcr.io"}
+
+	// 只有当使用 Docker Hub 时才使用加速器
+	if registry == "registry-1.docker.io" {
+		config.Mirrors = mirrors
+	}
+
+	result, err := tryRegistries(config, repository, operation)
 	if err != nil {
 		return "", err
 	}
 
-	// 完成下载，清除进度显示并换行
-	fmt.Println()
-
-	// 重命名临时文件
-	if err := os.Rename(tempFile, layerFile); err != nil {
-		// 如果重命名失败，尝试复制
-		if err := copyFile(tempFile, layerFile); err != nil {
-			return "", fmt.Errorf("移动文件失败: %v", err)
-		}
-		os.Remove(tempFile)
-	}
-
-	// 如果提供了缓存目录，将文件复制到缓存
-	if cacheDir != "" {
-		cacheFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
-		if err := copyFile(layerFile, cacheFile); err != nil {
-			fmt.Printf("警告: 无法将文件复制到缓存: %v\n", err)
-		}
-	}
-
-	// 清理状态文件
-	stateFile := getStateFilePath(tempDir, digest)
-	os.Remove(stateFile)
-
-	return layerFile, nil
+	return result.(string), nil
 }
 
 // 创建tar文件
