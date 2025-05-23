@@ -609,10 +609,29 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 
 		// 检查缓存
 		if cacheDir != "" {
-			if cachedFile, exists := checkLayerCache(cacheDir, digest); exists {
-				fmt.Printf("层 %d/%d: %s 从缓存中获取\n", i+1, layerCount, digest)
-				layerFiles[i] = cachedFile
-				continue
+			cachedFile, exists := checkLayerCache(cacheDir, digest)
+			if exists {
+				fmt.Printf("层 %d/%d: %s - Found in cache. Verifying integrity...\n", i+1, layerCount, digest)
+				verified, err := verifyFileChecksum(cachedFile, digest)
+				if err != nil {
+					fmt.Printf("警告: 层 %d/%d: %s - Error verifying cached file: %v. Deleting and re-downloading.\n", i+1, layerCount, digest, err)
+					if rmErr := os.Remove(cachedFile); rmErr != nil {
+						fmt.Printf("警告: 层 %d/%d: %s - Failed to delete corrupted cached file %s: %v\n", i+1, layerCount, digest, cachedFile, rmErr)
+					}
+					// Treat as cache miss, proceed to download
+				} else if verified {
+					fmt.Printf("层 %d/%d: %s - Cache hit and verified.\n", i+1, layerCount, digest)
+					layerFiles[i] = cachedFile
+					continue // Use cached file
+				} else {
+					fmt.Printf("警告: 层 %d/%d: %s - Cached file is corrupt. Deleting and re-downloading.\n", i+1, layerCount, digest)
+					if rmErr := os.Remove(cachedFile); rmErr != nil {
+						fmt.Printf("警告: 层 %d/%d: %s - Failed to delete corrupted cached file %s: %v\n", i+1, layerCount, digest, cachedFile, rmErr)
+					}
+					// Treat as cache miss, proceed to download
+				}
+			} else {
+				fmt.Printf("层 %d/%d: %s - Not found in cache. Proceeding to download.\n", i+1, layerCount, digest)
 			}
 		}
 
@@ -858,16 +877,41 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 		if err := os.Rename(tempFile, layerFile); err != nil {
 			// 如果重命名失败，尝试复制
 			if err := copyFile(tempFile, layerFile); err != nil {
-				return "", fmt.Errorf("移动文件失败: %v", err)
+				os.Remove(tempFile) // Clean up tempFile if copy also fails
+				return "", fmt.Errorf("moving downloaded file failed: %v", err)
 			}
-			os.Remove(tempFile)
+			os.Remove(tempFile) // Clean up tempFile after successful copy
 		}
 
-		// 如果提供了缓存目录，将文件复制到缓存
+		// Post-download verification
+		fmt.Printf("Verifying downloaded file %s for digest %s\n", layerFile, digest)
+		verified, err := verifyFileChecksum(layerFile, digest)
+		if err != nil {
+			os.Remove(layerFile) // Delete corrupted/unverifiable file
+			return "", fmt.Errorf("error verifying downloaded file %s: %w", layerFile, err)
+		}
+		if !verified {
+			os.Remove(layerFile) // Delete corrupted file
+			return "", fmt.Errorf("downloaded file %s failed integrity check for digest %s", layerFile, digest)
+		}
+		fmt.Printf("Downloaded file %s for digest %s verified successfully.\n", layerFile, digest)
+
+		// Atomic Cache Write
 		if cacheDir != "" {
 			cacheFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
-			if err := copyFile(layerFile, cacheFile); err != nil {
-				fmt.Printf("警告: 无法将文件复制到缓存: %v\n", err)
+			tempCacheFile := cacheFile + ".tmpdownload"
+
+			fmt.Printf("Caching layer %s to %s (via %s)\n", digest, cacheFile, tempCacheFile)
+			if err := copyFile(layerFile, tempCacheFile); err != nil {
+				os.Remove(tempCacheFile) // Clean up temporary cache file
+				fmt.Printf("警告: 无法将文件复制到临时缓存文件 %s: %v\n", tempCacheFile, err)
+			} else {
+				if err := os.Rename(tempCacheFile, cacheFile); err != nil {
+					os.Remove(tempCacheFile) // Clean up temporary cache file
+					fmt.Printf("警告: 无法重命名临时缓存文件 %s 到 %s: %v\n", tempCacheFile, cacheFile, err)
+				} else {
+					fmt.Printf("Successfully cached layer %s to %s\n", digest, cacheFile)
+				}
 			}
 		}
 
@@ -1566,6 +1610,43 @@ func calculateDiffID(filePath string) (string, error) {
 	}
 
 	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+}
+
+// calculateFileSHA256 calculates the SHA256 checksum of a file and returns it as a hex string.
+func calculateFileSHA256(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("failed to read file %s for hashing: %w", filePath, err)
+	}
+
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+// verifyFileChecksum verifies if the SHA256 checksum of a file matches the expected digest.
+// expectedDigest should be in the format "sha256:hexhash".
+func verifyFileChecksum(filePath string, expectedDigest string) (bool, error) {
+	parts := strings.SplitN(expectedDigest, ":", 2)
+	if len(parts) != 2 || parts[0] != "sha256" {
+		return false, fmt.Errorf("invalid digest format: %s, expected 'sha256:hexhash'", expectedDigest)
+	}
+	expectedHexHash := parts[1]
+
+	calculatedHexHash, err := calculateFileSHA256(filePath)
+	if err != nil {
+		return false, fmt.Errorf("failed to calculate checksum for %s: %w", filePath, err)
+	}
+
+	if calculatedHexHash != expectedHexHash {
+		return false, nil // Checksum mismatch
+	}
+
+	return true, nil // Checksums match
 }
 
 // 格式化时间
