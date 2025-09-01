@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -12,14 +13,37 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // 版本信息
 const version = "0.1.0"
+
+// 常量定义
+const (
+	// 缓冲区大小
+	DefaultBufferSize = 1024 * 1024 // 1MB
+
+	// 重试配置
+	DefaultRetryDelay = 2 * time.Second  // 初始重试延迟
+	MaxRetryDelay     = 60 * time.Second // 最大重试延迟
+	DefaultMaxRetries = 3                // 默认最大重试次数
+
+	// 超时配置
+	DefaultTimeoutMinutes = 10 // 默认HTTP超时时间（分钟）
+	DefaultConcurrency    = 1  // 默认并发数
+
+	// 进度更新间隔
+	ProgressUpdateInterval = 100 * time.Millisecond
+
+	// 默认架构
+	DefaultArch = "amd64"
+)
 
 // 配置选项
 type Config struct {
@@ -57,6 +81,29 @@ func (e *RegistryError) Error() string {
 	return fmt.Sprintf("registry %s: %s failed: %v", e.Registry, e.Op, e.Err)
 }
 
+// DownloadError 表示下载相关的错误
+type DownloadError struct {
+	Layer   string // 层摘要
+	Op      string // 操作类型
+	Attempt int    // 尝试次数
+	Err     error  // 原始错误
+}
+
+func (e *DownloadError) Error() string {
+	return fmt.Sprintf("download layer %s: %s failed (attempt %d): %v", e.Layer, e.Op, e.Attempt, e.Err)
+}
+
+// CacheError 表示缓存相关的错误
+type CacheError struct {
+	Path string // 文件路径
+	Op   string // 操作类型
+	Err  error  // 原始错误
+}
+
+func (e *CacheError) Error() string {
+	return fmt.Sprintf("cache %s: %s failed: %v", e.Path, e.Op, e.Err)
+}
+
 // DownloadState 保存下载状态
 type DownloadState struct {
 	LayerDigest  string    `json:"layer_digest"`
@@ -70,6 +117,21 @@ type DownloadState struct {
 func main() {
 	// 记录程序开始时间
 	startTime := time.Now()
+
+	// 设置信号处理，优雅退出
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 监听中断信号
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 启动信号处理goroutine
+	go func() {
+		<-sigChan
+		fmt.Println("\n接收到中断信号，正在优雅退出...")
+		cancel()
+	}()
 
 	config := parseFlags()
 
@@ -106,6 +168,14 @@ func main() {
 	// 记录准备工作结束时间
 	prepareEndTime := time.Now()
 
+	// 检查是否已被取消
+	select {
+	case <-ctx.Done():
+		fmt.Println("操作已被取消")
+		os.Exit(1)
+	default:
+	}
+
 	// 记录获取清单开始时间
 	manifestStartTime := time.Now()
 
@@ -131,7 +201,7 @@ func main() {
 	layersStartTime := time.Now()
 
 	// 下载镜像层
-	layers, err := downloadLayers(client, registry, repository, manifest, auth, tempDir, config.Mirrors, config.Retries, config.Concurrent)
+	layers, err := downloadLayers(ctx, client, registry, repository, manifest, auth, tempDir, config.Mirrors, config.Retries, config.Concurrent, config)
 	if err != nil {
 		fmt.Printf("下载镜像层失败: %v\n", err)
 		os.Exit(1)
@@ -150,7 +220,7 @@ func main() {
 	tarStartTime := time.Now()
 
 	// 创建tar文件
-	err = createTarFile(outputFile, manifest, layers, repository, tag)
+	err = createTarFile(ctx, client, registry, repository, outputFile, manifest, layers, auth, config.Mirrors, tag)
 	if err != nil {
 		fmt.Printf("创建tar文件失败: %v\n", err)
 		return
@@ -194,13 +264,13 @@ func parseFlags() Config {
 	flag.StringVar(&config.Registry, "r", "registry-1.docker.io", "Docker Registry地址")
 	flag.StringVar(&config.Username, "u", "", "Registry用户名")
 	flag.StringVar(&config.Password, "p", "", "Registry密码")
-	flag.StringVar(&config.Arch, "a", "amd64", "镜像架构 (例如: amd64, arm64)")
+	flag.StringVar(&config.Arch, "a", DefaultArch, "镜像架构 (例如: amd64, arm64)")
 	flag.StringVar(&config.CacheDir, "cache-dir", "", "层缓存目录 (默认: ~/.docker-pull/cache)")
 	flag.BoolVar(&config.Insecure, "k", false, "允许不安全的HTTPS连接")
 	flag.BoolVar(&config.ShowVersion, "version", false, "显示版本信息")
-	flag.IntVar(&config.Timeout, "timeout", 60*12, "HTTP超时时间（分钟）")
-	flag.IntVar(&config.Retries, "retries", 3, "下载重试次数")
-	flag.IntVar(&config.Concurrent, "concurrent", 5, "并发下载数量")
+	flag.IntVar(&config.Timeout, "timeout", DefaultTimeoutMinutes, "HTTP超时时间（分钟）")
+	flag.IntVar(&config.Retries, "retries", DefaultMaxRetries, "下载重试次数")
+	flag.IntVar(&config.Concurrent, "concurrent", DefaultConcurrency, "并发下载数量")
 
 	// 添加镜像加速器支持
 	var mirrors string
@@ -220,7 +290,7 @@ func parseFlags() Config {
 		fmt.Fprintf(os.Stderr, "      --version\t\t\t显示版本信息\n")
 		fmt.Fprintf(os.Stderr, "      --timeout int\t\tHTTP超时时间（分钟） (默认: 10)\n")
 		fmt.Fprintf(os.Stderr, "      --retries int\t\t下载重试次数 (默认: 3)\n")
-		fmt.Fprintf(os.Stderr, "      --concurrent int\t\t并发下载数量 (默认: 5)\n")
+		fmt.Fprintf(os.Stderr, "      --concurrent int\t\t并发下载数量 (默认: 1)\n")
 	}
 
 	flag.Parse()
@@ -250,24 +320,20 @@ func parseImageName(imageName, defaultRegistry string) (registry, repository, ta
 	// 默认标签为latest
 	tag = "latest"
 
-	// 检查是否包含标签
-	parts := strings.Split(imageName, ":")
-	if len(parts) > 1 {
-		// 检查是否包含端口号
-		if len(strings.Split(parts[1], "/")) > 1 {
-			// 包含端口号，将其作为registry的一部分
-			imageArr := parts[:len(parts)-1]
-			imageName = strings.Join(imageArr, ":")
-			tag = parts[len(parts)-1]
-		} else {
-			imageName = parts[0]
-			tag = parts[1]
+	// 从右向左查找标签，避免与端口号混淆
+	lastColonIndex := strings.LastIndex(imageName, ":")
+	if lastColonIndex != -1 {
+		// 检查冒号后的部分是否可能是标签
+		potentialTag := imageName[lastColonIndex+1:]
+		// 如果不包含斜杠且不全是数字（避免将端口号误认为标签）
+		if !strings.Contains(potentialTag, "/") && !isNumeric(potentialTag) {
+			tag = potentialTag
+			imageName = imageName[:lastColonIndex]
 		}
 	}
-	fmt.Println(imageName)
-	fmt.Println(tag)
+
 	// 检查是否包含registry
-	parts = strings.Split(imageName, "/")
+	parts := strings.Split(imageName, "/")
 	if len(parts) > 1 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":")) {
 		// 包含域名或端口号，认为是registry
 		registry = parts[0]
@@ -284,6 +350,19 @@ func parseImageName(imageName, defaultRegistry string) (registry, repository, ta
 	}
 
 	return
+}
+
+// isNumeric 检查字符串是否为纯数字（用于判断端口号）
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // 创建HTTP客户端
@@ -546,11 +625,10 @@ func contains(slice []string, str string) bool {
 }
 
 // 下载镜像层
-func downloadLayers(client *http.Client, registry, repository string, manifest map[string]interface{}, auth, tempDir string, mirrors []string, retries, concurrent int) ([]string, error) {
+func downloadLayers(ctx context.Context, client *http.Client, registry, repository string, manifest map[string]interface{}, auth, tempDir string, mirrors []string, retries, concurrent int, config Config) ([]string, error) {
 	var layers []interface{}
 
 	// 获取缓存目录
-	config := Config{} // 使用默认配置
 	cacheDir, err := getCacheDir(config)
 	if err != nil {
 		fmt.Printf("警告: 无法获取缓存目录: %v，将不使用缓存\n", err)
@@ -640,6 +718,14 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 		go func(index int, digest string) {
 			defer wg.Done()
 
+			// 检查上下文是否已取消
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+			}
+
 			// 等待信号量
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
@@ -647,7 +733,7 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 			fmt.Printf("下载层 %d/%d: %s\n", index+1, layerCount, digest)
 
 			// 下载层
-			layerFile, err := downloadLayer(client, registry, repository, digest, auth, tempDir, cacheDir, mirrors, retries)
+			layerFile, err := downloadLayer(ctx, client, registry, repository, digest, auth, tempDir, cacheDir, mirrors, retries)
 			if err != nil {
 				errChan <- fmt.Errorf("下载层 %d/%d (%s) 失败: %v", index+1, layerCount, digest, err)
 				return
@@ -675,8 +761,15 @@ func downloadLayers(client *http.Client, registry, repository string, manifest m
 }
 
 // downloadLayer 下载单个镜像层
-func downloadLayer(client *http.Client, registry, repository, digest, auth, tempDir, cacheDir string, mirrors []string, retries int) (string, error) {
+func downloadLayer(ctx context.Context, client *http.Client, registry, repository, digest, auth, tempDir, cacheDir string, mirrors []string, retries int) (string, error) {
 	operation := func(registry string) (interface{}, error) {
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
 		url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, digest)
 
 		// 如果提供了缓存目录，首先检查缓存
@@ -730,8 +823,8 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 
 		// 发送请求
 		var resp *http.Response
-		maxRetries := retries         // 最大重试次数
-		retryDelay := 2 * time.Second // 重试延迟
+		maxRetries := retries           // 最大重试次数
+		retryDelay := DefaultRetryDelay // 重试延迟
 
 		// 使用重试机制
 		for retryCount := 0; retryCount <= maxRetries; retryCount++ {
@@ -740,6 +833,10 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 				// 等待重试延迟
 				time.Sleep(retryDelay)
 				retryDelay *= 2 // 增加重试延迟
+				// 设置最大延迟上限
+				if retryDelay > MaxRetryDelay {
+					retryDelay = MaxRetryDelay
+				}
 			}
 
 			resp, err = client.Do(req)
@@ -790,7 +887,7 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 		var currentHash string
 
 		// 创建缓冲读取器
-		buf := make([]byte, 1024*1024) // 1MB buffer
+		buf := make([]byte, DefaultBufferSize)
 		teeReader := io.TeeReader(resp.Body, partialHash)
 
 		// 使用匿名函数确保资源正确释放
@@ -808,9 +905,9 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 					// 更新哈希
 					downloaded += int64(n)
 
-					// 每100ms更新一次进度显示
+					// 定期更新进度显示
 					now := time.Now()
-					if now.Sub(lastUpdateTime) >= 100*time.Millisecond {
+					if now.Sub(lastUpdateTime) >= ProgressUpdateInterval {
 						// 计算下载速度
 						elapsed := now.Sub(lastUpdateTime).Seconds()
 						speed := float64(downloaded-lastDownloaded) / elapsed
@@ -945,7 +1042,7 @@ func downloadLayer(client *http.Client, registry, repository, digest, auth, temp
 }
 
 // 创建tar文件
-func createTarFile(outputPath string, manifest map[string]interface{}, layerFiles []string, repository, tag string) error {
+func createTarFile(ctx context.Context, client *http.Client, registry, repository, outputPath string, manifest map[string]interface{}, layerFiles []string, auth string, mirrors []string, tag string) error {
 	// 创建临时目录用于存储压缩后的层文件
 	tempDir, err := os.MkdirTemp("", "docker-layers-*")
 	if err != nil {
@@ -977,20 +1074,8 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 			return fmt.Errorf("层文件无效: %v", err)
 		}
 
-		// 检查源文件是否为gzip文件
-		isGzip, err := isGzipFile(layerFile)
-		if err != nil {
-			return fmt.Errorf("检查源文件类型失败: %v", err)
-		}
-
-		// 如果是gzip文件，解压缩后再添加到tar
-		if isGzip {
-			uncompressedFile := filepath.Join(tempDir, fmt.Sprintf("uncompressed_%d.tar", i))
-			if err := uncompressGzipFile(layerFile, uncompressedFile); err != nil {
-				return fmt.Errorf("解压缩源文件失败: %v", err)
-			}
-			layerFile = uncompressedFile
-		}
+		// 注意：保持层文件的原始格式（通常是gzip压缩的）
+		// 这样可以显著减少最终tar文件的大小
 
 		// 添加层文件
 		layerTarPath := filepath.Join(layerID, "layer.tar")
@@ -1016,8 +1101,15 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 		}
 	}
 
+	// 下载配置blob
+	fmt.Println("正在下载镜像配置...")
+	configBlob, err := downloadConfigBlob(ctx, client, registry, repository, manifest, auth, mirrors)
+	if err != nil {
+		return fmt.Errorf("下载配置blob失败: %v", err)
+	}
+
 	// 获取镜像配置
-	config, err := getImageConfig(manifest)
+	config, err := getImageConfig(configBlob)
 	if err != nil {
 		return fmt.Errorf("获取镜像配置失败: %v", err)
 	}
@@ -1054,16 +1146,94 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 	return nil
 }
 
-// 获取镜像配置
-func getImageConfig(manifest map[string]interface{}) (map[string]interface{}, error) {
-	config := map[string]interface{}{
-		"architecture": "amd64",
-		"os":           "linux",
-		"config":       manifest["config"],
-		"created":      time.Now().UTC().Format(time.RFC3339Nano),
-		"history":      []interface{}{},
+// downloadConfigBlob 下载镜像配置blob
+func downloadConfigBlob(ctx context.Context, client *http.Client, registry, repository string, manifest map[string]interface{}, auth string, mirrors []string) (map[string]interface{}, error) {
+	// 从manifest中提取配置信息
+	configInfo, ok := manifest["config"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("manifest中缺少config信息")
 	}
-	return config, nil
+
+	digest, ok := configInfo["digest"].(string)
+	if !ok {
+		return nil, fmt.Errorf("config中缺少digest信息")
+	}
+
+	operation := func(registry string) (interface{}, error) {
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, digest)
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("下载配置blob失败，状态码: %d", resp.StatusCode)
+		}
+
+		var config map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+			return nil, fmt.Errorf("解析配置blob失败: %v", err)
+		}
+
+		return config, nil
+	}
+
+	// 创建包含镜像加速器配置的 Config
+	config := Config{
+		Registry: registry,
+		Mirrors:  []string{}, // 默认不使用加速器
+	}
+
+	// 定义需要使用加速器的仓库列表
+	acceleratedRegistry := []string{"registry-1.docker.io", "docker.io", "index.docker.io"}
+
+	// 检查是否需要使用加速器
+	if contains(acceleratedRegistry, registry) {
+		config.Mirrors = mirrors
+	}
+
+	result, err := tryRegistries(config, repository, operation)
+	if err != nil {
+		return nil, fmt.Errorf("下载配置blob失败: %v", err)
+	}
+
+	return result.(map[string]interface{}), nil
+}
+
+// 获取镜像配置
+func getImageConfig(configBlob map[string]interface{}) (map[string]interface{}, error) {
+	// 使用下载的配置blob，而不是创建新的配置
+	if configBlob == nil {
+		return nil, fmt.Errorf("配置blob为空")
+	}
+
+	// 确保必要的字段存在
+	if _, ok := configBlob["architecture"]; !ok {
+		configBlob["architecture"] = "amd64"
+	}
+	if _, ok := configBlob["os"]; !ok {
+		configBlob["os"] = "linux"
+	}
+
+	return configBlob, nil
 }
 
 // 生成镜像ID
@@ -1114,7 +1284,7 @@ func addFileToTar(tw *tar.Writer, filePath, tarPath string) error {
 	}
 
 	// 使用缓冲写入
-	buf := make([]byte, 1024*1024) // 1MB buffer
+	buf := make([]byte, DefaultBufferSize)
 	written := int64(0)
 	for {
 		n, err := file.Read(buf)
@@ -1364,10 +1534,46 @@ func getCacheDir(config Config) (string, error) {
 // 检查缓存中是否存在层文件
 func checkLayerCache(cacheDir, digest string) (string, bool) {
 	cachedFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
-	if _, err := os.Stat(cachedFile); err == nil {
+
+	// 检查文件是否存在
+	stat, err := os.Stat(cachedFile)
+	if err != nil {
+		return cachedFile, false
+	}
+
+	// 检查文件大小是否合理（大于0）
+	if stat.Size() == 0 {
+		// 删除空文件
+		os.Remove(cachedFile)
+		return cachedFile, false
+	}
+
+	// 验证文件完整性（通过计算摘要验证）
+	if isValidCachedFile(cachedFile, digest) {
 		return cachedFile, true
 	}
+
+	// 如果验证失败，删除损坏的缓存文件
+	os.Remove(cachedFile)
 	return cachedFile, false
+}
+
+// isValidCachedFile 验证缓存文件的完整性
+func isValidCachedFile(filePath, expectedDigest string) bool {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	// 计算文件的SHA256摘要
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return false
+	}
+
+	calculatedDigest := fmt.Sprintf("sha256:%x", hash.Sum(nil))
+	return calculatedDigest == expectedDigest
 }
 
 // 复制文件
@@ -1467,7 +1673,7 @@ func compressFileAndCalculateDiffID(srcPath, dstPath string) (string, error) {
 	teeReader := io.TeeReader(srcFile, hash)
 
 	// 使用缓冲写入
-	buf := make([]byte, 1024*1024) // 1MB buffer
+	buf := make([]byte, DefaultBufferSize)
 	for {
 		n, err := teeReader.Read(buf)
 		if n > 0 {
@@ -1567,7 +1773,7 @@ func calculateDiffID(filePath string) (string, error) {
 
 		// 计算解压缩后内容的哈希值
 		hash := sha256.New()
-		buf := make([]byte, 1024*1024) // 1MB buffer
+		buf := make([]byte, DefaultBufferSize)
 		for {
 			n, err := gr.Read(buf)
 			if n > 0 {
