@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -60,6 +62,29 @@ type RegistryError struct {
 
 func (e *RegistryError) Error() string {
 	return fmt.Sprintf("仓库 %s: %s 操作失败: %v", e.Registry, e.Op, e.Err)
+}
+
+// DownloadError 表示下载相关的错误
+type DownloadError struct {
+	Layer   string // 层摘要
+	Op      string // 操作类型
+	Attempt int    // 尝试次数
+	Err     error  // 原始错误
+}
+
+func (e *DownloadError) Error() string {
+	return fmt.Sprintf("download layer %s: %s failed (attempt %d): %v", e.Layer, e.Op, e.Attempt, e.Err)
+}
+
+// CacheError 表示缓存相关的错误
+type CacheError struct {
+	Path string // 文件路径
+	Op   string // 操作类型
+	Err  error  // 原始错误
+}
+
+func (e *CacheError) Error() string {
+	return fmt.Sprintf("cache %s: %s failed: %v", e.Path, e.Op, e.Err)
 }
 
 // DownloadState 保存下载状态
@@ -124,6 +149,24 @@ func (p *ProgressTracker) GetProgress() (completed int, total int, downloadedMB,
 
 // 主函数
 func main() {
+	// 记录程序开始时间
+	startTime := time.Now()
+
+	// 设置信号处理，优雅退出
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 监听中断信号
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 启动信号处理goroutine
+	go func() {
+		<-sigChan
+		fmt.Println("\n接收到中断信号，正在优雅退出...")
+		cancel()
+	}()
+
 	config := parseFlags()
 
 	if config.ShowVersion {
@@ -136,6 +179,9 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+	// 记录初始化结束时间
+	initEndTime := time.Now()
 
 	// 解析镜像名称
 	registry, repository, tag := parseImageName(config.Image, config.Registry)
@@ -156,7 +202,21 @@ func main() {
 	client := createHTTPClient(config)
 
 	// 获取认证信息
-	auth := getAuthToken(client, registry, repository, config.Username, config.Password)
+	auth := getAuthToken(client, registry, repository, config.Username, config.Password, config.Mirrors)
+
+	// 记录准备工作结束时间
+	prepareEndTime := time.Now()
+
+	// 检查是否已被取消
+	select {
+	case <-ctx.Done():
+		fmt.Println("操作已被取消")
+		os.Exit(1)
+	default:
+	}
+
+	// 记录获取清单开始时间
+	manifestStartTime := time.Now()
 
 	// 获取镜像清单
 	fmt.Println("正在获取镜像清单...")
@@ -165,6 +225,9 @@ func main() {
 		fmt.Printf("错误: 获取镜像清单失败: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 记录获取清单结束时间
+	manifestEndTime := time.Now()
 
 	// 创建临时目录
 	tempDir, err := os.MkdirTemp("", "docker-pull-*")
@@ -181,11 +244,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 记录下载层结束时间
+	layersEndTime := time.Now()
+
 	// 生成输出文件名
 	outputFile := config.Output
 	if outputFile == "" {
 		outputFile = fmt.Sprintf("%s-%s-%s.tar", strings.ReplaceAll(repository, "/", "_"), tag, config.Arch)
 	}
+
+	// 记录创建tar文件开始时间
+	tarStartTime := time.Now()
 
 	// 创建tar文件
 	fmt.Println("正在创建镜像文件...")
@@ -283,23 +352,20 @@ func parseImageName(imageName, defaultRegistry string) (registry, repository, ta
 	// 默认标签为latest
 	tag = "latest"
 
-	// 检查是否包含标签
-	parts := strings.Split(imageName, ":")
-	if len(parts) > 1 {
-		// 检查是否包含端口号
-		if len(strings.Split(parts[1], "/")) > 1 {
-			// 包含端口号，将其作为registry的一部分
-			imageArr := parts[:len(parts)-1]
-			imageName = strings.Join(imageArr, ":")
-			tag = parts[len(parts)-1]
-		} else {
-			imageName = parts[0]
-			tag = parts[1]
+	// 从右向左查找标签，避免与端口号混淆
+	lastColonIndex := strings.LastIndex(imageName, ":")
+	if lastColonIndex != -1 {
+		// 检查冒号后的部分是否可能是标签
+		potentialTag := imageName[lastColonIndex+1:]
+		// 如果不包含斜杠且不全是数字（避免将端口号误认为标签）
+		if !strings.Contains(potentialTag, "/") && !isNumeric(potentialTag) {
+			tag = potentialTag
+			imageName = imageName[:lastColonIndex]
 		}
 	}
 
 	// 检查是否包含registry
-	parts = strings.Split(imageName, "/")
+	parts := strings.Split(imageName, "/")
 	if len(parts) > 1 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":")) {
 		// 包含域名或端口号，认为是registry
 		registry = parts[0]
@@ -335,6 +401,22 @@ func createHTTPClient(config Config) *http.Client {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
+	return true
+}
+
+// 创建HTTP客户端
+func createHTTPClient(insecure bool, timeout int) *http.Client {
+	// 创建传输配置
+	transport := &http.Transport{
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		MaxConnsPerHost:     50,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  false,
+	}
+
+	// 创建客户端
 	return &http.Client{
 		Transport: tr,
 		Timeout:   config.Timeout,
@@ -342,13 +424,38 @@ func createHTTPClient(config Config) *http.Client {
 }
 
 // 获取认证令牌
-func getAuthToken(client *http.Client, registry, repository, username, password string) string {
+func getAuthToken(client *http.Client, registry, repository, username, password string, mirrors []string) string {
 	// 如果提供了用户名和密码，先尝试Basic认证
 	if username != "" && password != "" {
 		auth := fmt.Sprintf("%s:%s", username, password)
 		return "Basic " + base64Encode(auth)
 	}
 
+	// 定义Docker Hub相关域名
+	acceleratedRegistry := []string{
+		"registry-1.docker.io",
+		"docker.io",
+		"index.docker.io",
+	}
+
+	// 如果是Docker Hub，尝试使用镜像加速器
+	if contains(acceleratedRegistry, registry) && len(mirrors) > 0 {
+		// 尝试每个镜像加速器
+		for _, mirror := range mirrors {
+			// 尝试使用镜像加速器获取认证令牌
+			if token := tryGetAuthToken(client, mirror, repository, username, password); token != "" {
+				fmt.Printf("成功使用镜像加速器获取认证令牌: %s\n", mirror)
+				return token
+			}
+		}
+	}
+
+	// 如果镜像加速器失败或不是Docker Hub，使用原始仓库
+	return tryGetAuthToken(client, registry, repository, username, password)
+}
+
+// 尝试从镜像仓库获取认证令牌
+func tryGetAuthToken(client *http.Client, registry, repository, username, password string) string {
 	// 尝试获取token认证
 	authURL := fmt.Sprintf("https://%s/v2/", registry)
 	req, err := http.NewRequest("GET", authURL, nil)
@@ -800,6 +907,7 @@ func downloadLayerWithProgress(client *http.Client, registry, repository, digest
 		if err != nil {
 			return "", err
 		}
+
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
@@ -841,7 +949,7 @@ func downloadLayerWithProgress(client *http.Client, registry, repository, digest
 			if copyErr := copyFile(tempFile, layerFile); copyErr != nil {
 				return "", fmt.Errorf("移动文件失败: %v", copyErr)
 			}
-			os.Remove(tempFile)
+			os.Remove(tempFile) // Clean up tempFile after successful copy
 		}
 
 		// 缓存文件
@@ -907,7 +1015,7 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 
 		diffID, err := calculateDiffID(layerFile)
 		if err != nil {
-			return fmt.Errorf("计算diffID失败: %v", err)
+			return fmt.Errorf("计算diff ID失败: %v", err)
 		}
 		diffIDs[i] = diffID
 
@@ -920,6 +1028,13 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 		if err := addLayerJSON(tw, layerID); err != nil {
 			return fmt.Errorf("添加json文件失败: %v", err)
 		}
+	}
+
+	// 下载配置blob
+	fmt.Println("正在下载镜像配置...")
+	configBlob, err := downloadConfigBlob(ctx, client, registry, repository, manifest, auth, mirrors)
+	if err != nil {
+		return fmt.Errorf("下载配置blob失败: %v", err)
 	}
 
 	// 获取镜像配置
@@ -958,6 +1073,78 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 	}
 
 	return nil
+}
+
+// downloadConfigBlob 下载镜像配置blob
+func downloadConfigBlob(ctx context.Context, client *http.Client, registry, repository string, manifest map[string]interface{}, auth string, mirrors []string) (map[string]interface{}, error) {
+	// 从manifest中提取配置信息
+	configInfo, ok := manifest["config"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("manifest中缺少config信息")
+	}
+
+	digest, ok := configInfo["digest"].(string)
+	if !ok {
+		return nil, fmt.Errorf("config中缺少digest信息")
+	}
+
+	operation := func(registry string) (interface{}, error) {
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", registry, repository, digest)
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("下载配置blob失败，状态码: %d", resp.StatusCode)
+		}
+
+		var config map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+			return nil, fmt.Errorf("解析配置blob失败: %v", err)
+		}
+
+		return config, nil
+	}
+
+	// 创建包含镜像加速器配置的 Config
+	config := Config{
+		Registry: registry,
+		Mirrors:  []string{}, // 默认不使用加速器
+	}
+
+	// 定义需要使用加速器的仓库列表
+	acceleratedRegistry := []string{"registry-1.docker.io", "docker.io", "index.docker.io"}
+
+	// 检查是否需要使用加速器
+	if contains(acceleratedRegistry, registry) {
+		config.Mirrors = mirrors
+	}
+
+	result, err := tryRegistries(config, repository, operation)
+	if err != nil {
+		return nil, fmt.Errorf("下载配置blob失败: %v", err)
+	}
+
+	return result.(map[string]interface{}), nil
 }
 
 // 获取镜像配置
@@ -1019,12 +1206,13 @@ func addFileToTar(tw *tar.Writer, filePath, tarPath string) error {
 		return fmt.Errorf("写入tar头部失败: %v", err)
 	}
 
-	// 使用缓冲读取
-	buf := make([]byte, 1024*1024) // 1MB buffer
+	// 使用缓冲写入
+	buf := make([]byte, DefaultBufferSize)
 	written := int64(0)
 	for {
 		n, err := file.Read(buf)
 		if n > 0 {
+			// 写入文件
 			nw, err := tw.Write(buf[:n])
 			if err != nil {
 				return fmt.Errorf("写入tar内容失败: %v", err)
@@ -1269,10 +1457,46 @@ func getCacheDir(config Config) (string, error) {
 // 检查缓存中是否存在层文件
 func checkLayerCache(cacheDir, digest string) (string, bool) {
 	cachedFile := filepath.Join(cacheDir, strings.Replace(digest, ":", "_", 1))
-	if _, err := os.Stat(cachedFile); err == nil {
+
+	// 检查文件是否存在
+	stat, err := os.Stat(cachedFile)
+	if err != nil {
+		return cachedFile, false
+	}
+
+	// 检查文件大小是否合理（大于0）
+	if stat.Size() == 0 {
+		// 删除空文件
+		os.Remove(cachedFile)
+		return cachedFile, false
+	}
+
+	// 验证文件完整性（通过计算摘要验证）
+	if isValidCachedFile(cachedFile, digest) {
 		return cachedFile, true
 	}
+
+	// 如果验证失败，删除损坏的缓存文件
+	os.Remove(cachedFile)
 	return cachedFile, false
+}
+
+// isValidCachedFile 验证缓存文件的完整性
+func isValidCachedFile(filePath, expectedDigest string) bool {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	// 计算文件的SHA256摘要
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return false
+	}
+
+	calculatedDigest := fmt.Sprintf("sha256:%x", hash.Sum(nil))
+	return calculatedDigest == expectedDigest
 }
 
 // 复制文件
@@ -1336,7 +1560,7 @@ func compressFileAndCalculateDiffID(srcPath, dstPath string) (string, error) {
 	// 打开源文件
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
-		return "", fmt.Errorf("打开源文件失败: %v", err)
+		return "", fmt.Errorf("打开文件失败: %v", err)
 	}
 	defer srcFile.Close()
 
@@ -1372,10 +1596,11 @@ func compressFileAndCalculateDiffID(srcPath, dstPath string) (string, error) {
 	teeReader := io.TeeReader(srcFile, hash)
 
 	// 使用缓冲写入
-	buf := make([]byte, 1024*1024) // 1MB buffer
+	buf := make([]byte, DefaultBufferSize)
 	for {
 		n, err := teeReader.Read(buf)
 		if n > 0 {
+			// 写入文件
 			if _, err := gw.Write(buf[:n]); err != nil {
 				return "", fmt.Errorf("写入压缩数据失败: %v", err)
 			}
@@ -1442,7 +1667,7 @@ func calculateUncompressedHash(gzipFile string) (string, error) {
 
 // 计算文件的 diff ID
 func calculateDiffID(filePath string) (string, error) {
-	// 检查文件是否为gzip格式
+	// 打开文件
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("打开文件失败: %v", err)
@@ -1457,14 +1682,45 @@ func calculateDiffID(filePath string) (string, error) {
 
 	// 如果是gzip文件（魔数为1f 8b）
 	if header[0] == 0x1f && header[1] == 0x8b {
-		return calculateUncompressedHash(filePath)
+		// 重置文件指针
+		if _, err := file.Seek(0, 0); err != nil {
+			return "", fmt.Errorf("重置文件指针失败: %v", err)
+		}
+
+		// 创建gzip reader
+		gr, err := gzip.NewReader(file)
+		if err != nil {
+			return "", fmt.Errorf("创建gzip reader失败: %v", err)
+		}
+		defer gr.Close()
+
+		// 计算解压缩后内容的哈希值
+		hash := sha256.New()
+		buf := make([]byte, DefaultBufferSize)
+		for {
+			n, err := gr.Read(buf)
+			if n > 0 {
+				if _, err := hash.Write(buf[:n]); err != nil {
+					return "", fmt.Errorf("计算哈希失败: %v", err)
+				}
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return "", fmt.Errorf("读取解压缩数据失败: %v", err)
+			}
+		}
+
+		return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
 	}
 
-	// 如果不是gzip文件，计算原始内容的哈希值
+	// 如果不是gzip文件，重置文件指针并计算原始内容的哈希值
 	if _, err := file.Seek(0, 0); err != nil {
 		return "", fmt.Errorf("重置文件指针失败: %v", err)
 	}
 
+	// 计算文件内容的哈希值
 	hash := sha256.New()
 	buf := make([]byte, 1024*1024) // 1MB buffer
 	for {
@@ -1483,4 +1739,108 @@ func calculateDiffID(filePath string) (string, error) {
 	}
 
 	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+}
+
+// calculateFileSHA256 calculates the SHA256 checksum of a file and returns it as a hex string.
+func calculateFileSHA256(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("failed to read file %s for hashing: %w", filePath, err)
+	}
+
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+// verifyFileChecksum verifies if the SHA256 checksum of a file matches the expected digest.
+// expectedDigest should be in the format "sha256:hexhash".
+func verifyFileChecksum(filePath string, expectedDigest string) (bool, error) {
+	parts := strings.SplitN(expectedDigest, ":", 2)
+	if len(parts) != 2 || parts[0] != "sha256" {
+		return false, fmt.Errorf("invalid digest format: %s, expected 'sha256:hexhash'", expectedDigest)
+	}
+	expectedHexHash := parts[1]
+
+	calculatedHexHash, err := calculateFileSHA256(filePath)
+	if err != nil {
+		return false, fmt.Errorf("failed to calculate checksum for %s: %w", filePath, err)
+	}
+
+	if calculatedHexHash != expectedHexHash {
+		return false, nil // Checksum mismatch
+	}
+
+	return true, nil // Checksums match
+}
+
+// 格式化时间
+func formatDuration(d time.Duration) string {
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	var result string
+	if hours > 0 {
+		result += fmt.Sprintf("%d小时", hours)
+	}
+	if minutes > 0 {
+		result += fmt.Sprintf("%d分钟", minutes)
+	}
+	if seconds > 0 || result == "" {
+		result += fmt.Sprintf("%d秒", seconds)
+	}
+
+	return result
+}
+
+// 检查文件是否为gzip文件
+func isGzipFile(filePath string) (bool, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	// 读取前几个字节来检查gzip魔数
+	header := make([]byte, 2)
+	_, err = file.Read(header)
+	if err != nil {
+		return false, err
+	}
+
+	// 如果是gzip文件（魔数为1f 8b）
+	return header[0] == 0x1f && header[1] == 0x8b, nil
+}
+
+// 解压缩gzip文件
+func uncompressGzipFile(srcPath, dstPath string) error {
+	// 打开源文件
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	// 创建gzip reader
+	gr, err := gzip.NewReader(srcFile)
+	if err != nil {
+		return err
+	}
+	defer gr.Close()
+
+	// 创建目标文件
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	// 解压缩数据
+	_, err = io.Copy(dstFile, gr)
+	return err
 }

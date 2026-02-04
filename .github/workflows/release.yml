@@ -31,7 +31,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.20'
+        go-version: '1.23'
 
     - name: Build
       env:
@@ -39,7 +39,7 @@ jobs:
         GOARCH: ${{ matrix.goarch }}
         CGO_ENABLED: 0
       run: |
-        go build -a -ldflags '-extldflags "-static"' -o dip-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+        go build -a -ldflags '-extldflags "-static"' -o dip-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} main.go
 
 
     - name: Upload artifact
