@@ -174,6 +174,18 @@ func main() {
 	}
 	defer os.RemoveAll(tempDir)
 
+	// 获取完整的镜像配置
+	var imageConfig map[string]interface{}
+	if configInfo, ok := manifest["config"].(map[string]interface{}); ok {
+		if configDigest, ok := configInfo["digest"].(string); ok {
+			fmt.Println("正在获取镜像配置...")
+			imageConfig, err = getImageConfigBlob(client, registry, repository, configDigest, auth, config.Mirrors)
+			if err != nil {
+				fmt.Printf("警告: 获取镜像配置失败: %v，将使用默认配置\n", err)
+			}
+		}
+	}
+
 	// 下载镜像层（支持并发）
 	layers, err := downloadLayersConcurrent(client, registry, repository, manifest, auth, tempDir, config)
 	if err != nil {
@@ -189,7 +201,7 @@ func main() {
 
 	// 创建tar文件
 	fmt.Println("正在创建镜像文件...")
-	err = createTarFile(outputFile, manifest, layers, repository, tag, config.Arch)
+	err = createTarFile(outputFile, manifest, layers, repository, tag, config.Arch, imageConfig)
 	if err != nil {
 		fmt.Printf("错误: 创建tar文件失败: %v\n", err)
 		os.Exit(1)
@@ -582,6 +594,55 @@ func contains(slice []string, str string) bool {
 	return false
 }
 
+// getImageConfigBlob 从 registry 获取完整的镜像配置
+func getImageConfigBlob(client *http.Client, registry, repository, configDigest, auth string, mirrors []string) (map[string]interface{}, error) {
+	operation := func(reg string) (interface{}, error) {
+		url := fmt.Sprintf("https://%s/v2/%s/blobs/%s", reg, repository, configDigest)
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("获取配置失败，状态码: %d", resp.StatusCode)
+		}
+
+		var config map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+			return nil, err
+		}
+
+		return config, nil
+	}
+
+	cfg := Config{
+		Registry: registry,
+		Mirrors:  []string{},
+	}
+
+	if registry == defaultRegistry {
+		cfg.Mirrors = mirrors
+	}
+
+	result, err := tryRegistries(cfg, repository, operation)
+	if err != nil {
+		return nil, err
+	}
+
+	return result.(map[string]interface{}), nil
+}
+
 // extractLayersFromManifest 从manifest中提取层信息
 func extractLayersFromManifest(manifest map[string]interface{}) ([]map[string]interface{}, error) {
 	var rawLayers []interface{}
@@ -873,7 +934,7 @@ func downloadLayerWithProgress(client *http.Client, registry, repository, digest
 }
 
 // 创建tar文件
-func createTarFile(outputPath string, manifest map[string]interface{}, layerFiles []string, repository, tag, arch string) error {
+func createTarFile(outputPath string, manifest map[string]interface{}, layerFiles []string, repository, tag, arch string, imageConfig map[string]interface{}) error {
 	tempDir, err := os.MkdirTemp("", "docker-layers-*")
 	if err != nil {
 		return fmt.Errorf("创建临时目录失败: %v", err)
@@ -922,13 +983,21 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 		}
 	}
 
-	// 获取镜像配置
-	config, err := getImageConfig(manifest, arch)
-	if err != nil {
-		return fmt.Errorf("获取镜像配置失败: %v", err)
+	// 使用完整的镜像配置或创建默认配置
+	var config map[string]interface{}
+	if imageConfig != nil {
+		config = imageConfig
+	} else {
+		config = map[string]interface{}{
+			"architecture": arch,
+			"os":           "linux",
+			"config":       map[string]interface{}{},
+			"created":      time.Now().UTC().Format(time.RFC3339Nano),
+			"history":      []interface{}{},
+		}
 	}
 
-	// 添加rootfs信息
+	// 添加/更新rootfs信息
 	config["rootfs"] = map[string]interface{}{
 		"type":     "layers",
 		"diff_ids": diffIDs,
@@ -958,18 +1027,6 @@ func createTarFile(outputPath string, manifest map[string]interface{}, layerFile
 	}
 
 	return nil
-}
-
-// 获取镜像配置
-func getImageConfig(manifest map[string]interface{}, arch string) (map[string]interface{}, error) {
-	config := map[string]interface{}{
-		"architecture": arch,
-		"os":           "linux",
-		"config":       manifest["config"],
-		"created":      time.Now().UTC().Format(time.RFC3339Nano),
-		"history":      []interface{}{},
-	}
-	return config, nil
 }
 
 // 生成镜像ID
