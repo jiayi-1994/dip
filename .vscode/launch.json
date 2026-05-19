@@ -13,9 +13,9 @@
             "program": "${workspaceFolder}/main.go",
             "cwd": "${workspaceFolder}",
             "args": [
-                "-image",
+                "-i",
                 "172.27.208.223:10043/xjy/worktest/busybox:1.33",
-                "-insecure"
+                "-k"
             ],
             "env": {},
             "showLog": true
