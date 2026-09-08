@@ -33,7 +33,6 @@ const (
 	defaultRetryCount  = 3
 	defaultRetryDelay  = 2 * time.Second
 	defaultConcurrency = 3
-	defaultMirrors     = "docker.gh-proxy.com,docker.1ms.run,docker.xjyi.me"
 )
 
 // Config 配置选项
@@ -231,7 +230,7 @@ func parseFlags() Config {
 
 	var mirrors string
 	var timeout int
-	flag.StringVar(&mirrors, "m", defaultMirrors, "镜像加速器地址列表，多个地址用逗号分隔")
+	flag.StringVar(&mirrors, "m", os.Getenv("DOCKER_PULL_MIRRORS"), "镜像加速器地址列表，逗号分隔（默认直连，可通过 DOCKER_PULL_MIRRORS 配置；-m= 强制直连）")
 	flag.IntVar(&timeout, "timeout", int(defaultTimeout.Seconds()), "下载超时时间（秒）")
 
 	flag.Usage = func() {
@@ -245,7 +244,8 @@ func parseFlags() Config {
 		fmt.Fprintf(os.Stderr, "  -p string     Registry密码\n")
 		fmt.Fprintf(os.Stderr, "  -a string     镜像架构 (默认: %s)\n", defaultArch)
 		fmt.Fprintf(os.Stderr, "  -c int        并发下载数 (默认: %d)\n", defaultConcurrency)
-		fmt.Fprintf(os.Stderr, "  -m string     镜像加速器地址列表，逗号分隔\n")
+		fmt.Fprintf(os.Stderr, "  -m string     镜像加速器地址列表，逗号分隔（默认直连，可通过 DOCKER_PULL_MIRRORS 配置）\n")
+		fmt.Fprintf(os.Stderr, "                使用 -m= 忽略环境变量中的加速器并强制直连\n")
 		fmt.Fprintf(os.Stderr, "  -k            允许不安全的HTTPS连接\n")
 		fmt.Fprintf(os.Stderr, "  --retry int   下载失败重试次数 (默认: %d)\n", defaultRetryCount)
 		fmt.Fprintf(os.Stderr, "  --timeout int 下载超时时间/秒 (默认: %d)\n", int(defaultTimeout.Seconds()))
@@ -261,17 +261,9 @@ func parseFlags() Config {
 
 	config.Timeout = time.Duration(timeout) * time.Second
 
-	if mirrors != "" {
-		config.Mirrors = strings.Split(mirrors, ",")
-		for i := range config.Mirrors {
-			config.Mirrors[i] = strings.TrimSpace(config.Mirrors[i])
-		}
-	}
-
-	if envMirrors := os.Getenv("DOCKER_PULL_MIRRORS"); envMirrors != "" && len(config.Mirrors) == 0 {
-		config.Mirrors = strings.Split(envMirrors, ",")
-		for i := range config.Mirrors {
-			config.Mirrors[i] = strings.TrimSpace(config.Mirrors[i])
+	for _, mirror := range strings.Split(mirrors, ",") {
+		if mirror = strings.TrimSpace(mirror); mirror != "" {
+			config.Mirrors = append(config.Mirrors, mirror)
 		}
 	}
 

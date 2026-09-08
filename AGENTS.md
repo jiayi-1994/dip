@@ -16,7 +16,7 @@
 
 ### Notes
 
-- There are no automated tests in this project (no `_test.go` files). Validation is done by building and running the tool against a real registry.
-- The tool requires network access to Docker registries at runtime. Built-in Chinese mirror accelerators are used by default; disable with `-m ""`.
+- Run `go test ./...` for mirror configuration and registry selection regression tests. Also validate by building and running the tool against a real registry.
+- The tool requires network access to Docker registries at runtime and connects directly by default. Custom mirrors are opt-in via `-m` or `DOCKER_PULL_MIRRORS`; use `-m=` to force direct access, including in Windows PowerShell.
 - Output `.tar` files and the cache directory (`~/.docker-pull/cache`) are generated at runtime — clean them up as needed. The `.gitignore` already excludes `*.tar` and the `dip` binary.
 - No `go.sum` file exists because there are zero external dependencies.

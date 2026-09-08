@@ -8,7 +8,7 @@
 - 🔄 **并发下载** - 支持多线程并发下载，大幅提升下载速度
 - 🔁 **自动重试** - 网络不稳定时自动重试，确保下载成功
 - ✅ **完整性验证** - 下载后自动校验摘要，确保文件完整性
-- 🏎️ **镜像加速** - 内置国内镜像加速器支持，提升下载速度
+- 🌐 **默认直连** - 直接访问原始镜像仓库，可按需配置自定义加速器
 - 📦 **层缓存** - 智能缓存已下载的层，重复下载秒速完成
 - 🔐 **身份验证** - 支持公共和私有 Docker Registry
 - 🖥️ **多架构** - 支持 amd64、arm64 等多种架构
@@ -25,8 +25,11 @@ go build -o dip .
 ### 基本用法
 
 ```bash
-# 拉取镜像
+# 拉取镜像（默认直连，无需指定 -m）
 dip -i nginx:latest
+
+# 从 GitHub Container Registry 直连拉取
+dip -i ghcr.io/jiayi-1994/ai-flowchart:sha-0520fbb
 
 # 指定输出文件
 dip -i nginx:latest -o nginx.tar
@@ -52,7 +55,7 @@ dip -i private-registry.com/myapp:v1.0 -u user -p pass
 | `-p` | | Registry密码 | 空 |
 | `-a` | | 镜像架构 (amd64, arm64等) | amd64 |
 | `-c` | | 并发下载数 (1-10) | 3 |
-| `-m` | | 镜像加速器地址列表 | 内置加速器 |
+| `-m` | | 镜像加速器地址列表，逗号分隔；`-m=` 强制直连 | 空（直连）；可由 `DOCKER_PULL_MIRRORS` 配置 |
 | `-k` | | 允许不安全的HTTPS连接 | false |
 | `--retry` | | 下载失败重试次数 | 3 |
 | `--timeout` | | 下载超时时间（秒） | 300 |
@@ -85,10 +88,9 @@ dip -i nginx:latest
 仓库: registry-1.docker.io
 并发数: 3
 重试次数: 3
-镜像加速器: docker.gh-proxy.com, docker.1ms.run, docker.xjyi.me
 ========================================
 正在获取镜像清单...
-✓ 使用镜像加速器: docker.gh-proxy.com
+✓ 使用原始仓库: registry-1.docker.io
 发现 7 个镜像层，使用 3 个并发下载
 进度: [7/7层] 65.2 MB / 65.2 MB (12.50 MB/s)
 ✓ 所有 7 个层下载完成
@@ -118,18 +120,24 @@ dip -i nginx:latest -c 5 --retry 5
 # 指定超时时间为10分钟
 dip -i large-image:latest --timeout 600
 
-# 禁用镜像加速器
-dip -i nginx:latest -m ""
+# 强制直连，忽略环境变量中配置的镜像加速器
+dip -i nginx:latest -m=
 
 # 使用自定义加速器
 dip -i nginx:latest -m "mirror1.example.com,mirror2.example.com"
 ```
 
+默认不使用镜像加速器，已移除所有内置加速器地址。只有显式设置 `-m` 或 `DOCKER_PULL_MIRRORS` 时才会使用自定义加速器。
+
+**PowerShell 用户**：旧版 PowerShell 可能丢弃 `-m ""` 中的空字符串，导致 `flag needs an argument: -m`。默认直连时省略 `-m` 即可；需要覆盖环境变量时使用 `-m=`，该写法也适用于其他 Shell。
+
 ## 🔧 环境变量
 
 | 变量名 | 描述 |
 |--------|------|
-| `DOCKER_PULL_MIRRORS` | 镜像加速器地址列表，逗号分隔 |
+| `DOCKER_PULL_MIRRORS` | 可选的镜像加速器地址列表，逗号分隔；未设置时直连 |
+
+命令行 `-m` 优先于环境变量，显式传入 `-m=` 会禁用环境变量中的加速器。列表中的空白项会被忽略。
 
 ## 📄 版本历史
 
