@@ -141,6 +141,13 @@ dip -i nginx:latest -m "mirror1.example.com,mirror2.example.com"
 
 ## 📄 版本历史
 
+### v2.0.1
+- 默认直连原始镜像仓库，移除所有内置加速器地址
+- 保留通过 `-m` 或 `DOCKER_PULL_MIRRORS` 配置自定义加速器
+- 支持使用 `-m=` 强制直连并覆盖环境变量，更新 PowerShell 使用说明
+- 新增镜像加速器配置和仓库选择回归测试
+- 同步程序内版本号与 Release 版本号
+
 ### v0.2.0
 - ✨ 新增并发下载功能
 - ✨ 新增下载重试机制

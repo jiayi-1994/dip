@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-const version = "0.3.0"
+const version = "2.0.1"
 
 const (
 	defaultRegistry    = "registry-1.docker.io"
